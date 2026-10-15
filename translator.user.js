@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      3.7
+// @version      3.8
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
+// @match        https://prod-edge-eate.wpml.org/*
 // @updateURL    https://raw.githubusercontent.com/EverConvert-Inc/translating/main/translator.user.js
 // @downloadURL  https://raw.githubusercontent.com/EverConvert-Inc/translating/main/translator.user.js
 // @connect      generativelanguage.googleapis.com
