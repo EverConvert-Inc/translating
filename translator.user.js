@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      3.8
+// @version      3.9
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -373,6 +373,7 @@
       if (ed && ed.isEditable && hasText(ed.getHTML())) {
         return {
           kind: 'tiptap',
+          raw: ed, // the real TipTap Editor instance — doOne()'s TipTap branch needs direct ProseMirror access (state.doc, state.tr, view.dispatch), not just getHTML/setHTML
           getHTML: () => ed.getHTML(),
           setHTML: (html) => ed.chain().focus().setContent(html, true).run(),
         };
@@ -446,6 +447,102 @@
     errorLog: [],
   };
 
+  // ---------- TipTap write path (added 2026-10-23) ----------
+  // Tested live by Carlos against ATE build index.js?v=5.0.1.11 — console-run directly against
+  // document.querySelector('.tiptap.ProseMirror').editor on each segment (opened by click, closed
+  // with Escape afterward, not via doOne()/closeEditor() — see the flag on that below), not through
+  // this file. Wrote segments 1,2,4,5,7,8,10,12,13,14 on that page; wpml.verify() afterward came
+  // back missing=[] markerLost=[], with "english" only on the URL slug and image title (identical
+  // in both languages by design, not a real miss). Ported verbatim below — reformatted for this
+  // file's style only, logic unchanged — except the [[P]] addition noted at its use site, which is
+  // this session's addition, not part of what Carlos ran.
+  //
+  // Node types on that page: editor.state.schema.nodes = paragraph, doc, hardBreak, text, gMarker,
+  // xMarker. A heading's marker is the paragraph node ITSELF (DOM: <p data-block-tag="h2"
+  // data-paragraph-gid="gid_0">), not a child gMarker (confirmed live, segment 14 — mk had
+  // g/x/g markers but the editor had exactly one gMarker node and no xMarker at all: the heading's
+  // own marker and the x marker both resolve to non-node form). A marker's gid in mk[] can diverge
+  // from the gid the editor actually assigned the matching node (confirmed live, segment 2 — a list
+  // segment's mk gids didn't match the editor's gMarker gids for the same labels) — gid match is
+  // tried first, text match is the fallback, in that order, exactly as tested.
+  function writeSeg(editor, item, res) {
+    const doc = editor.state.doc, edits = [], L = res.linkTexts || [], mk = item.mk || [];
+    const nodes = [];
+    doc.descendants((n, pos) => {
+      if (n.type.name === 'gMarker' || n.type.name === 'xMarker') nodes.push({ n, pos, used: false });
+    });
+    const blockG = new Set();
+    mk.forEach((m, i) => {
+      if (m.t !== 'g') return; // x markers are never translated/written, same as every other path in this file
+      let hit = nodes.find((o) => !o.used && o.n.attrs.gid === m.gid) ||
+        nodes.find((o) => !o.used && o.n.type.name === 'gMarker' && norm(o.n.textContent) === norm(m.s));
+      if (hit) {
+        hit.used = true;
+        if (L[i] != null && hit.n.content.size) edits.push({ from: hit.pos + 1, to: hit.pos + 1 + hit.n.content.size, text: L[i] });
+        return;
+      }
+      // No gMarker/xMarker node matched — this is the heading-is-the-marker case. Find the
+      // top-level paragraph whose own text equals the marker's label.
+      let found = null;
+      doc.forEach((p, off) => {
+        if (!found && !blockG.has(off) && p.type.name === 'paragraph' && norm(p.textContent) === norm(m.s)) found = { p, off };
+      });
+      if (!found) {
+        if (!norm(m.s)) return; // empty label, nothing to find or write — not an error
+        throw new Error('marker ' + m.gid + ' "' + m.s.slice(0, 25) + '" not found');
+      }
+      blockG.add(found.off); // excludes this paragraph from the plain-text run pass below
+      if (L[i] != null) edits.push({ from: found.off + 1, to: found.off + 1 + found.p.content.size, text: L[i] });
+    });
+    // Plain text runs: contiguous text-node sequences inside each top-level paragraph NOT already
+    // claimed as a block-level marker above, broken wherever a non-text child (e.g. a marker node)
+    // interrupts the run.
+    const runs = [];
+    doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph' || blockG.has(off)) return;
+      let cur = null;
+      p.forEach((c, co) => {
+        const pos = off + 1 + co;
+        if (c.isText) {
+          if (!cur) { cur = { from: pos, to: pos, text: '' }; runs.push(cur); }
+          cur.to = pos + c.nodeSize;
+          cur.text += c.text;
+        } else {
+          cur = null;
+        }
+      });
+    });
+    // [[P]] added here, not in the originally-tested regex (/\{\{\d+\}\}/ alone) — every segment
+    // Carlos tested had paraCount:1, so tp/tmpl never actually contained a [[P]] token to split on.
+    // Without this, a grouped (paraCount>1) segment's paragraph-break token stays glued to one run
+    // and mismatches the editor's separately-counted paragraph runs. Consistent with the rest of
+    // this function's logic, but UNTESTED against a real paraCount>1 TipTap segment — flagged, not
+    // assumed safe.
+    const splitRe = /\{\{\d+\}\}|\[\[P\]\]/;
+    const er = runs.filter((r) => norm(r.text));
+    const sr = item.tp.split(splitRe).filter((t) => norm(t));
+    const tg = res.tmpl.split(splitRe).filter((t) => norm(t));
+    if (er.length !== sr.length || sr.length !== tg.length) {
+      throw new Error('run count editor=' + er.length + ' src=' + sr.length + ' tgt=' + tg.length);
+    }
+    er.forEach((r, k) => {
+      if (norm(r.text) !== norm(sr[k])) throw new Error('run ' + k + ' mismatch');
+      // Leading/trailing whitespace preserved from the source run, so the translated text keeps the
+      // same surrounding spacing style rather than whatever the AI's output happened to have.
+      const lead = r.text.match(/^\s*/)[0], trail = r.text.match(/\s*$/)[0];
+      edits.push({ from: r.from, to: r.to, text: lead + norm(tg[k]) + trail });
+    });
+    // One transaction, applied end-of-document backwards, so each edit's recorded [from,to) is
+    // still valid when it's applied — nothing earlier in the doc shifts a range still to come.
+    edits.sort((a, b) => b.from - a.from);
+    let tr = editor.state.tr;
+    edits.forEach((e) => { tr = tr.insertText(e.text, e.from, e.to); });
+    editor.view.dispatch(tr);
+    let cnt = 0;
+    editor.state.doc.descendants((n) => { if (n.type.name === 'gMarker' || n.type.name === 'xMarker') cnt++; });
+    return { edits: edits.length, markersBefore: nodes.length, markersAfter: cnt };
+  }
+
   // ---------- translate one segment ----------
   async function doOne(idx, tmplEs, linkTexts) {
     const meta = state.it[idx];
@@ -458,6 +555,30 @@
     if (!ed) return 'NOEDITOR';
     await sleep(150); // was 350 (originally 180) — openEditor() already polls until the editor is live,
     // and setContent/setHTML applies instantly once it exists; this margin was dead wait, confirmed live 2026-09-16
+
+    // TipTap write path — see writeSeg() above for what's tested vs. flagged. TinyMCE is completely
+    // unaffected: everything below this block is the original, unchanged TinyMCE route.
+    if (ed.kind === 'tiptap') {
+      let result;
+      try {
+        result = writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts });
+      } catch (e) {
+        return 'TIPTAP_WRITE_ERROR: ' + e.message;
+      }
+      if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
+
+      // Same delayed-overwrite guard as the TinyMCE path below, using TipTap's own getText().
+      // Flagged: Carlos's live test closed each segment with Escape, not via closeEditor()'s
+      // close-button click — this exact doOne()/closeEditor() wiring hasn't been run yet.
+      const beforeText = norm(ed.raw.getText());
+      await sleep(300);
+      const afterText = norm(ed.raw.getText());
+      if (afterText !== beforeText) {
+        try { writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts }); } catch (e) { /* still report the revert below either way */ }
+        return 'CONTENT_REVERTED';
+      }
+      return 'OK';
+    }
 
     const d = document.createElement('div');
     d.innerHTML = ed.getHTML();
