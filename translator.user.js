@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      3.9
+// @version      4.0
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -466,21 +466,33 @@
   // segment's mk gids didn't match the editor's gMarker gids for the same labels) — gid match is
   // tried first, text match is the fallback, in that order, exactly as tested.
   function writeSeg(editor, item, res) {
-    const doc = editor.state.doc, edits = [], L = res.linkTexts || [], mk = item.mk || [];
+    const doc = editor.state.doc, schema = editor.state.schema;
+    const edits = []; // {from, to, text} = insertText (heading label only); {from, to, content} = replaceWith (paragraph rebuild)
+    const L = res.linkTexts || [], mk = item.mk || [];
     const nodes = [];
     doc.descendants((n, pos) => {
       if (n.type.name === 'gMarker' || n.type.name === 'xMarker') nodes.push({ n, pos, used: false });
     });
     const blockG = new Set();
+    const tokenNode = new Array(mk.length).fill(null); // resolved PM node per {{n}} token, consumed by the
+    // paragraph rebuild below — label text (L[i]) is applied there via node.copy()/type.create(), not here,
+    // so a marker's own edit never overlaps a full-paragraph replace of the paragraph that contains it.
     mk.forEach((m, i) => {
-      if (m.t !== 'g') return; // x markers are never translated/written, same as every other path in this file
+      // Text-match fallback now also tried for x markers (previously only gMarker) — needed because the
+      // paragraph rebuild below has to place a *node* for every token, not just 'g' ones. gid match (no
+      // type filter) is unchanged from before for both.
       let hit = nodes.find((o) => !o.used && o.n.attrs.gid === m.gid) ||
-        nodes.find((o) => !o.used && o.n.type.name === 'gMarker' && norm(o.n.textContent) === norm(m.s));
+        nodes.find((o) => !o.used && o.n.type.name === (m.t === 'g' ? 'gMarker' : 'xMarker') && norm(o.n.textContent) === norm(m.s));
       if (hit) {
         hit.used = true;
-        if (L[i] != null && hit.n.content.size) edits.push({ from: hit.pos + 1, to: hit.pos + 1 + hit.n.content.size, text: L[i] });
+        tokenNode[i] = hit.n;
         return;
       }
+      if (m.t !== 'g') return; // x marker with no matching node anywhere (seen live on a heading-shaped
+      // segment, confirmed 2026-10-16 — the heading's own marker and a nested x both resolved to non-node
+      // form). Never translated anyway; if its paragraph isn't blockG, the rebuild below falls back to its
+      // own recorded label text verbatim. If its paragraph IS blockG, this token is never visited at all
+      // (see "if (blockG.has(off)) return" below) — unchanged from before.
       // No gMarker/xMarker node matched — this is the heading-is-the-marker case. Find the
       // top-level paragraph whose own text equals the marker's label.
       let found = null;
@@ -491,52 +503,92 @@
         if (!norm(m.s)) return; // empty label, nothing to find or write — not an error
         throw new Error('marker ' + m.gid + ' "' + m.s.slice(0, 25) + '" not found');
       }
-      blockG.add(found.off); // excludes this paragraph from the plain-text run pass below
+      blockG.add(found.off); // excludes this paragraph from the token-order rebuild below — untouched heading branch
       if (L[i] != null) edits.push({ from: found.off + 1, to: found.off + 1 + found.p.content.size, text: L[i] });
     });
-    // Plain text runs: contiguous text-node sequences inside each top-level paragraph NOT already
-    // claimed as a block-level marker above, broken wherever a non-text child (e.g. a marker node)
-    // interrupts the run.
-    const runs = [];
-    doc.forEach((p, off) => {
-      if (p.type.name !== 'paragraph' || blockG.has(off)) return;
-      let cur = null;
-      p.forEach((c, co) => {
-        const pos = off + 1 + co;
-        if (c.isText) {
-          if (!cur) { cur = { from: pos, to: pos, text: '' }; runs.push(cur); }
-          cur.to = pos + c.nodeSize;
-          cur.text += c.text;
-        } else {
-          cur = null;
-        }
-      });
-    });
-    // [[P]] added here, not in the originally-tested regex (/\{\{\d+\}\}/ alone) — every segment
-    // Carlos tested had paraCount:1, so tp/tmpl never actually contained a [[P]] token to split on.
-    // Without this, a grouped (paraCount>1) segment's paragraph-break token stays glued to one run
-    // and mismatches the editor's separately-counted paragraph runs. Consistent with the rest of
-    // this function's logic, but UNTESTED against a real paraCount>1 TipTap segment — flagged, not
-    // assumed safe.
-    const splitRe = /\{\{\d+\}\}|\[\[P\]\]/;
-    const er = runs.filter((r) => norm(r.text));
-    const sr = item.tp.split(splitRe).filter((t) => norm(t));
-    const tg = res.tmpl.split(splitRe).filter((t) => norm(t));
-    if (er.length !== sr.length || sr.length !== tg.length) {
-      throw new Error('run count editor=' + er.length + ' src=' + sr.length + ' tgt=' + tg.length);
+
+    // ---------- token-order paragraph rebuild (2026-10-28, NOT yet verified live) ----------
+    // Replaces the old "plain text runs" section: that approach matched translated text onto the editor's
+    // EXISTING contiguous text-node runs by position/count, which assumed a marker's relative position to
+    // surrounding text never changes between source and translation. It throws 'run count editor=X src=Y
+    // tgt=Z' the moment a marker moves — e.g. Spanish needing "La " in front of a marker that had no text
+    // before it in English adds a non-empty split piece on the target side with no matching editor-run
+    // boundary (confirmed repro: segment 9720484708, "{{0}} is the direct result…" -> "La {{0}} es el
+    // resultado…", marker text "Road rash"). Per-marker reordering is explicitly allowed by the AI prompt,
+    // so the fix is to stop relying on run *position* at all: rebuild each non-heading top-level paragraph's
+    // content directly from tmpl's own {{n}} token order, reusing the real marker nodes (resolved above) so
+    // their gid/attrs survive untouched, and replace that paragraph's whole content in one step. The heading
+    // (blockG) branch above is completely unchanged and untouched by this — its paragraphs are skipped here.
+    const tpParas = item.tp.split('[[P]]');
+    const tgParas = res.tmpl.split('[[P]]');
+    if (tpParas.length !== tgParas.length) {
+      throw new Error('paragraph count mismatch: source has ' + tpParas.length + ' [[P]] section(s), translation has ' + tgParas.length);
     }
-    er.forEach((r, k) => {
-      if (norm(r.text) !== norm(sr[k])) throw new Error('run ' + k + ' mismatch');
-      // Leading/trailing whitespace preserved from the source run, so the translated text keeps the
-      // same surrounding spacing style rather than whatever the AI's output happened to have.
-      const lead = r.text.match(/^\s*/)[0], trail = r.text.match(/\s*$/)[0];
-      edits.push({ from: r.from, to: r.to, text: lead + norm(tg[k]) + trail });
+    let paraIdx = 0;
+    doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph') return;
+      const myIdx = paraIdx++;
+      if (blockG.has(off)) return; // heading/block-level marker paragraph — already fully handled above
+      // hardBreak (soft line break) has no {{n}} token or other representation anywhere in extraction —
+      // the AI never sees it, so there is no way to know where a rebuilt paragraph's line break should go.
+      // Never confirmed live either way (not part of the original run-matching bug, but a full-content
+      // replace is the point where it would go from "pre-existing latent issue" to "silently deleted"), so
+      // fail loudly instead of guessing.
+      let hasHardBreak = false;
+      p.forEach((c) => { if (c.type.name === 'hardBreak') hasHardBreak = true; });
+      if (hasHardBreak) {
+        throw new Error('HARDBREAK_UNSUPPORTED paragraph ' + myIdx + ' — line break inside a translated paragraph, needs manual handling');
+      }
+      const tmplSlice = tgParas[myIdx];
+      if (tmplSlice == null) {
+        throw new Error('paragraph ' + myIdx + ' has no matching translated [[P]] section (translation has ' + tgParas.length + ')');
+      }
+      const content = [];
+      const parts = tmplSlice.split(/(\{\{\d+\}\})/);
+      parts.forEach((part, pi) => {
+        const tm = part.match(/^\{\{(\d+)\}\}$/);
+        if (tm) {
+          const n = parseInt(tm[1], 10);
+          const m = mk[n];
+          if (!m) throw new Error('token {{' + n + '}} has no matching marker in mk[]');
+          const node = tokenNode[n];
+          if (!node) {
+            // Unreachable for 'g' in normal operation — a 'g' token either resolves to a node above, or its
+            // paragraph was added to blockG (and is skipped by the "if (blockG.has(off))" check above), or
+            // it already threw. Thrown here instead of silently dropped in case an AI reorder ever moves a
+            // token across a [[P]] boundary into a different paragraph than it started in.
+            if (m.t === 'g') throw new Error('token {{' + n + '}} (g) could not be resolved to an editor node');
+            if (m.s) content.push(schema.text(m.s)); // x with no node anywhere: inline its own recorded label verbatim
+            return;
+          }
+          if (m.t === 'g' && L[n] != null && node.content.size) {
+            content.push(node.type.create(node.attrs, schema.text(L[n]), node.marks));
+          } else {
+            content.push(node);
+          }
+          return;
+        }
+        // Whitespace collapsed to single spaces but NOT trimmed per-piece — the AI's own spacing choice
+        // around a repositioned marker (e.g. the trailing space in "La ") is exactly what needs to survive,
+        // since there's no longer a fixed source run to borrow lead/trail whitespace from. Only the very
+        // first/last piece of the whole paragraph is trimmed, so the rebuilt paragraph doesn't start or end
+        // with a stray space.
+        let text = part.replace(/\s+/g, ' ');
+        if (pi === 0) text = text.replace(/^\s+/, '');
+        if (pi === parts.length - 1) text = text.replace(/\s+$/, '');
+        if (text) content.push(schema.text(text));
+      });
+      edits.push({ from: off + 1, to: off + 1 + p.content.size, content });
     });
+    if (paraIdx !== tgParas.length) {
+      throw new Error('paragraph count mismatch: editor has ' + paraIdx + ' top-level paragraph(s), translation has ' + tgParas.length);
+    }
+
     // One transaction, applied end-of-document backwards, so each edit's recorded [from,to) is
     // still valid when it's applied — nothing earlier in the doc shifts a range still to come.
     edits.sort((a, b) => b.from - a.from);
     let tr = editor.state.tr;
-    edits.forEach((e) => { tr = tr.insertText(e.text, e.from, e.to); });
+    edits.forEach((e) => { tr = e.content ? tr.replaceWith(e.from, e.to, e.content) : tr.insertText(e.text, e.from, e.to); });
     editor.view.dispatch(tr);
     let cnt = 0;
     editor.state.doc.descendants((n) => { if (n.type.name === 'gMarker' || n.type.name === 'xMarker') cnt++; });
