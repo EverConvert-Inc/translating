@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.0
+// @version      4.1
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -474,6 +474,8 @@
       if (n.type.name === 'gMarker' || n.type.name === 'xMarker') nodes.push({ n, pos, used: false });
     });
     const blockG = new Set();
+    const blockGTokens = new Set(); // mk-indices already consumed by a blockG (heading) match — stripped if
+    // they leak into a shared non-heading paragraph's slice (see the extraction-undercount note below)
     const tokenNode = new Array(mk.length).fill(null); // resolved PM node per {{n}} token, consumed by the
     // paragraph rebuild below — label text (L[i]) is applied there via node.copy()/type.create(), not here,
     // so a marker's own edit never overlaps a full-paragraph replace of the paragraph that contains it.
@@ -504,6 +506,8 @@
         throw new Error('marker ' + m.gid + ' "' + m.s.slice(0, 25) + '" not found');
       }
       blockG.add(found.off); // excludes this paragraph from the token-order rebuild below — untouched heading branch
+      blockGTokens.add(i); // this {{n}} is already fully handled via the insertText edit above — stripped if it
+      // leaks into a shared slice below (see "extraction paraCount undercount" note)
       if (L[i] != null) edits.push({ from: found.off + 1, to: found.off + 1 + found.p.content.size, text: L[i] });
     });
 
@@ -524,11 +528,34 @@
     if (tpParas.length !== tgParas.length) {
       throw new Error('paragraph count mismatch: source has ' + tpParas.length + ' [[P]] section(s), translation has ' + tgParas.length);
     }
-    let paraIdx = 0;
+
+    // extraction's own [[P]] count is driven by the CLOSED segment's DOM block count, which can undercount
+    // relative to the OPEN editor's real top-level paragraph count — confirmed live, segment 9721018903:
+    // a heading (blockG, matched above) + body paragraph that the editor shows as 2 separate paragraphs, but
+    // the closed DOM exposed only 1 matchable block, so tp/tmpl came back with NO [[P]] at all and the
+    // heading's own {{0}} ended up glued to the front of what should have been the body's own slice. Two
+    // known-good shapes, chosen by matching tgParas.length against the editor's real structure (never
+    // guessed from extraction's paraCount alone): one slice per TOTAL top-level paragraph (extraction
+    // detected every block correctly — the original, still-common case) or one slice per NON-heading
+    // paragraph (extraction collapsed heading+body into one undivided template — this segment's shape,
+    // handled by skipping blockGTokens below so the heading's leaked token doesn't contaminate the body's
+    // content). Any other count is a genuinely unexplained shape — reported, never guessed past.
+    let totalParagraphs = 0;
+    doc.forEach((p) => { if (p.type.name === 'paragraph') totalParagraphs++; });
+    const nonBlockGCount = totalParagraphs - blockG.size;
+    let mode;
+    if (tgParas.length === totalParagraphs) mode = 'all';
+    else if (tgParas.length === nonBlockGCount) mode = 'nonBlockGOnly';
+    else throw new Error('PARA_MISMATCH_exp' + totalParagraphs + 'or' + nonBlockGCount + '_got' + tgParas.length);
+
+    let paraIdx = 0; // counts ALL top-level paragraphs, for error messages and 'all' mode indexing
+    let sliceIdx = 0; // counts only non-blockG top-level paragraphs, for 'nonBlockGOnly' mode indexing
     doc.forEach((p, off) => {
       if (p.type.name !== 'paragraph') return;
       const myIdx = paraIdx++;
       if (blockG.has(off)) return; // heading/block-level marker paragraph — already fully handled above
+      const useIdx = mode === 'all' ? myIdx : sliceIdx;
+      sliceIdx++;
       // hardBreak (soft line break) has no {{n}} token or other representation anywhere in extraction —
       // the AI never sees it, so there is no way to know where a rebuilt paragraph's line break should go.
       // Never confirmed live either way (not part of the original run-matching bug, but a full-content
@@ -539,16 +566,18 @@
       if (hasHardBreak) {
         throw new Error('HARDBREAK_UNSUPPORTED paragraph ' + myIdx + ' — line break inside a translated paragraph, needs manual handling');
       }
-      const tmplSlice = tgParas[myIdx];
+      const tmplSlice = tgParas[useIdx];
       if (tmplSlice == null) {
-        throw new Error('paragraph ' + myIdx + ' has no matching translated [[P]] section (translation has ' + tgParas.length + ')');
+        throw new Error('paragraph ' + myIdx + ' (slice ' + useIdx + ', mode ' + mode + ') has no matching translated [[P]] section (translation has ' + tgParas.length + ')');
       }
       const content = [];
       const parts = tmplSlice.split(/(\{\{\d+\}\})/);
-      parts.forEach((part, pi) => {
+      parts.forEach((part) => {
         const tm = part.match(/^\{\{(\d+)\}\}$/);
         if (tm) {
           const n = parseInt(tm[1], 10);
+          if (blockGTokens.has(n)) return; // already written via the heading's own insertText edit above —
+          // strip it rather than re-resolve/re-render a token that isn't really this paragraph's content
           const m = mk[n];
           if (!m) throw new Error('token {{' + n + '}} has no matching marker in mk[]');
           const node = tokenNode[n];
@@ -568,20 +597,33 @@
           }
           return;
         }
-        // Whitespace collapsed to single spaces but NOT trimmed per-piece — the AI's own spacing choice
-        // around a repositioned marker (e.g. the trailing space in "La ") is exactly what needs to survive,
-        // since there's no longer a fixed source run to borrow lead/trail whitespace from. Only the very
-        // first/last piece of the whole paragraph is trimmed, so the rebuilt paragraph doesn't start or end
-        // with a stray space.
-        let text = part.replace(/\s+/g, ' ');
-        if (pi === 0) text = text.replace(/^\s+/, '');
-        if (pi === parts.length - 1) text = text.replace(/\s+$/, '');
+        // Whitespace collapsed to single spaces but NOT trimmed here — trimming happens on the final
+        // assembled content array below, since a stripped blockG token (above) can leave what WAS a
+        // middle piece sitting at the edge of this paragraph's actual content.
+        const text = part.replace(/\s+/g, ' ');
         if (text) content.push(schema.text(text));
       });
+      // Trim the final assembled content's edges (not the raw split pieces), so the rebuilt paragraph
+      // doesn't start or end with a stray space — correct even when a leading/trailing blockG token got
+      // stripped out above. The AI's own spacing choice around a repositioned marker (e.g. the trailing
+      // space in "La ") is still preserved mid-paragraph, only the two true outer edges are touched.
+      if (content.length && content[0].type.name === 'text') {
+        content[0] = schema.text(content[0].text.replace(/^\s+/, ''));
+      }
+      if (content.length && content[content.length - 1].type.name === 'text') {
+        const li = content.length - 1;
+        content[li] = schema.text(content[li].text.replace(/\s+$/, ''));
+      }
+      while (content.length && content[0].type.name === 'text' && !content[0].text) content.shift();
+      while (content.length && content[content.length - 1].type.name === 'text' && !content[content.length - 1].text) content.pop();
       edits.push({ from: off + 1, to: off + 1 + p.content.size, content });
     });
-    if (paraIdx !== tgParas.length) {
-      throw new Error('paragraph count mismatch: editor has ' + paraIdx + ' top-level paragraph(s), translation has ' + tgParas.length);
+    // sliceIdx only ever counts NON-blockG paragraphs (it increments after the blockG skip above, in
+    // either mode) — so the invariant to check is always against nonBlockGCount, never totalParagraphs,
+    // regardless of which mode fired. This isn't "mode-aware", it's mode-INDEPENDENT: a blockG paragraph
+    // never consumes a slice in either mode, so it was never part of what this count is verifying.
+    if (sliceIdx !== nonBlockGCount) {
+      throw new Error('paragraph count mismatch: rebuilt ' + sliceIdx + ' paragraph(s) in mode ' + mode + ', expected ' + nonBlockGCount);
     }
 
     // One transaction, applied end-of-document backwards, so each edit's recorded [from,to) is
