@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.1
+// @version      4.2
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -590,7 +590,11 @@
             if (m.s) content.push(schema.text(m.s)); // x with no node anywhere: inline its own recorded label verbatim
             return;
           }
-          if (m.t === 'g' && L[n] != null && node.content.size) {
+          if (m.t === 'g' && L[n] && node.content.size) {
+            // L[n] must be non-empty here, not just non-null — schema.text('') throws immediately
+            // (ProseMirror rejects zero-length text nodes at construction, not just at the edges of
+            // a paragraph), so an AI-translated label of '' falls through to the unchanged-node branch
+            // below instead of attempting to build one.
             content.push(node.type.create(node.attrs, schema.text(L[n]), node.marks));
           } else {
             content.push(node);
@@ -607,13 +611,22 @@
       // doesn't start or end with a stray space — correct even when a leading/trailing blockG token got
       // stripped out above. The AI's own spacing choice around a repositioned marker (e.g. the trailing
       // space in "La ") is still preserved mid-paragraph, only the two true outer edges are touched.
+      // A trim that empties the piece entirely (e.g. a lone whitespace-only leftover after a stripped
+      // blockG token) must be removed outright, never rebuilt via schema.text('') — that call throws
+      // the instant it's made, before the old while-loop guards below ever got a chance to run.
       if (content.length && content[0].type.name === 'text') {
-        content[0] = schema.text(content[0].text.replace(/^\s+/, ''));
+        const trimmedStart = content[0].text.replace(/^\s+/, '');
+        if (trimmedStart) content[0] = schema.text(trimmedStart);
+        else content.shift();
       }
       if (content.length && content[content.length - 1].type.name === 'text') {
         const li = content.length - 1;
-        content[li] = schema.text(content[li].text.replace(/\s+$/, ''));
+        const trimmedEnd = content[li].text.replace(/\s+$/, '');
+        if (trimmedEnd) content[li] = schema.text(trimmedEnd);
+        else content.pop();
       }
+      // Defensive no-op now (nothing above can leave an empty text node at either edge), kept as a
+      // cheap last-resort guard rather than removed.
       while (content.length && content[0].type.name === 'text' && !content[0].text) content.shift();
       while (content.length && content[content.length - 1].type.name === 'text' && !content[content.length - 1].text) content.pop();
       edits.push({ from: off + 1, to: off + 1 + p.content.size, content });
