@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.2
+// @version      4.3
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -154,6 +154,38 @@
   // spans directly in the container (0 block children, or inline spans only) and must stay on the
   // old single-string path untouched. Markers are replaced with {{n}} globally across the whole
   // container BEFORE splitting into blocks, so numbering stays global across pieces as before.
+  const BLOCK_SEL = ':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > p,:scope > li';
+
+  // WPML can also nest a segment's real blocks inside a wrapper div instead of putting them directly
+  // under the text container — confirmed live 2026-10-29, segments 9721018938/40/41 (a single
+  // "eate-PartialT…"-classed div holding the real P/H2/H3/LI children; matched structurally here, not
+  // by that class, since it isn't documented as a stable name). A blind ':scope > ...' query on the
+  // container itself found 0 blocks for these and fell back to paraCount:1, which left the AI with no
+  // [[P]] boundaries for a real 3-6 paragraph segment. Unwraps through a chain of single-element-child
+  // wrappers until a level with its own direct block children is found.
+  //
+  // Known gap, deliberately unresolved rather than guessed at: if a container ever has a real block AND
+  // a wrapper sibling at the same level (e.g. <div><p>…</p><div><h2>…</h2></div></div>), this returns as
+  // soon as it finds the directly-visible block and never descends into the sibling wrapper, under-
+  // counting. Never observed live; safe-fails into the existing PARA_MISMATCH_exp..._got... throw
+  // downstream rather than silently mis-splitting, so it surfaces as a reported mismatch, not corrupted
+  // output, if it ever happens.
+  //
+  // Stops rather than guesses the moment a level has 0 or >1 children: a container with more than one
+  // child at some level has never been seen and isn't assumed safe to pick a side of. A segment with no
+  // p/h/li anywhere (the common flat/inline case) always bottoms out at null, same as the old 0-blocks
+  // result — unaffected. Depth-capped at 5 as a defensive bound only; every live case seen is 1 level.
+  function findBlockContainer(root) {
+    let node = root;
+    for (let depth = 0; depth < 5; depth++) {
+      const blocks = node.querySelectorAll(BLOCK_SEL);
+      if (blocks.length) return { container: node, blocks };
+      if (node.children.length !== 1) return null;
+      node = node.children[0];
+    }
+    return null;
+  }
+
   function tmpl(el) {
     const c = el.cloneNode(true);
     const outer = outerMarks(c);
@@ -165,12 +197,12 @@
       });
       outer[k].replaceWith(document.createTextNode(' {{' + k + '}} '));
     }
-    const blocks = c.querySelectorAll(':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > p,:scope > li');
-    if (blocks.length <= 1) {
+    const found = findBlockContainer(c);
+    if (!found || found.blocks.length <= 1) {
       return { template: norm(c.textContent), marks, paraCount: 1 };
     }
-    const template = Array.prototype.map.call(blocks, (b) => norm(b.textContent)).join(' [[P]] ');
-    return { template, marks, paraCount: blocks.length };
+    const template = Array.prototype.map.call(found.blocks, (b) => norm(b.textContent)).join(' [[P]] ');
+    return { template, marks, paraCount: found.blocks.length };
   }
 
   // ---------- extraction from React fiber state (closed-segment "x" marker fix) ----------
@@ -257,14 +289,14 @@
       const value = findSegmentFiberValue(el, id);
       if (!value || typeof value.original_content !== 'string') return null;
       const parsed = parseOriginalContent(value.original_content, 0);
-      const blocks = tn.querySelectorAll(':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6,:scope > p,:scope > li');
-      if (blocks.length <= 1) {
+      const found = findBlockContainer(tn);
+      if (!found || found.blocks.length <= 1) {
         return { template: parsed.piece, marks: parsed.marks, paraCount: 1 };
       }
-      const domBlockTexts = Array.prototype.map.call(blocks, (b) => norm(b.textContent));
+      const domBlockTexts = Array.prototype.map.call(found.blocks, (b) => norm(b.textContent));
       const pieces = splitTemplateByDomBlocks(parsed.piece, parsed.marks, domBlockTexts);
       if (!pieces) return null; // couldn't align fiber text to DOM blocks — caller falls back to tmpl()
-      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: blocks.length };
+      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: found.blocks.length };
     } catch (e) {
       return null;
     }
