@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.5
+// @version      4.6
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -1143,6 +1143,12 @@
   }
 
   // ---------- verify ----------
+  // URL-slug segments (e.g. "i-dont-like-my-workers-comp-physician") are excluded from the english
+  // check only: confirmed live 2026-11-09 that the ATE slug segment doesn't drive the live permalink
+  // (WPML already serves the Spanish slug), so an identical source/target slug is expected, not a miss.
+  // Lowercase, hyphen-joined, no spaces/punctuation — capitalized or spaced text never matches.
+  const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
+
   function startVerify() {
     state.vJob = { done: false, total: 0, missing: [], english: [], markerLost: [] };
     (async function () {
@@ -1162,7 +1168,7 @@
           const add = items[i].querySelector('.AT-segment_list__add_translation_button');
           const tr = items[i].querySelector('.AT-segment_list__translation');
           if (add) { state.vJob.missing.push(id + ':' + key.slice(0, 40)); continue; }
-          if (tr && norm(tr.textContent) === key) state.vJob.english.push(id + ':' + key.slice(0, 40));
+          if (tr && norm(tr.textContent) === key && !SLUG_RE.test(key)) state.vJob.english.push(id + ':' + key.slice(0, 40));
           const om = tn.querySelectorAll('span[class*="ate-chip--marker"]').length;
           if (om > 0 && tr) {
             const tm = tr.querySelectorAll('span[class*="ate-chip--marker"]').length;
