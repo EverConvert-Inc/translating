@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.4
+// @version      4.5
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -713,6 +713,194 @@
     return { edits: edits.length, markersBefore: nodes.length, markersAfter: cnt };
   }
 
+  // ---------- live-doc retranslate escalation (2026-11-09) ----------
+  // writeSeg() above is completely untouched by this. Triggered only when its batch-provided tmpl
+  // can't be reconciled against the live doc (extraction undercounted — e.g. a nested list collapsed
+  // to one flat piece — or a hardbreak the AI was never shown), or when it wrote successfully but still
+  // lost a marker (ambiguous gid/text resolution against extraction's separately-sourced mk[]). Builds
+  // a fresh template directly from editor.state.doc (the single source of truth — no closed-DOM/fiber
+  // involved) and re-translates just this one segment, so the AI does the language-correct paragraph
+  // and hardbreak splitting against the real structure, instead of any character-position guess. One
+  // shot only: called at most once per doOne() attempt, never recursively — a bad retry result fails
+  // loud, it is never retried again.
+  //
+  // No heading/blockG special-casing is needed here, unlike writeSeg: that branch exists only because
+  // *extraction* happens to wrap a heading's whole text in one marker token at the source-XLIFF level —
+  // a property of extraction's representation, not of the live doc. Walking editor.state.doc directly,
+  // a heading paragraph with zero marker children just produces a piece with zero {{n}} tokens, handled
+  // by the exact same generic per-block rebuild as any plain paragraph (list items too — confirmed live
+  // earlier that list items are plain 'paragraph'-type nodes, same as headings).
+
+  // These three patterns are coupled 1:1 to writeSeg()'s own (untouched) thrown Error messages:
+  // "paragraph count mismatch: source has..." (tp/tmpl [[P]] self-consistency), "PARA_MISMATCH_exp..."
+  // (mode-detection vs. the live doc), "HARDBREAK_UNSUPPORTED..." (no AI representation for a line
+  // break). If writeSeg's wording ever changes, these must be updated too, or the escalation silently
+  // stops firing for that class — named and centralized here specifically so that coupling is visible
+  // rather than buried in a scattered string comparison.
+  const RETRY_TRIGGERS = {
+    PARA_SELF_MISMATCH: /^paragraph count mismatch: source has \d+ \[\[P\]\] section/,
+    PARA_MISMATCH_VS_LIVE: /^PARA_MISMATCH_exp/,
+    HARDBREAK_UNSUPPORTED: /^HARDBREAK_UNSUPPORTED/,
+  };
+  function isRetryableWriteError(message) {
+    return Object.keys(RETRY_TRIGGERS).some((k) => RETRY_TRIGGERS[k].test(message));
+  }
+
+  // Walks every top-level paragraph-type block uniformly (heading/list/plain — no distinction, see
+  // above) building a fresh {{n}}/[[BR]]/[[P]] template straight from the live nodes. Marker resolution
+  // and request-building happen in the SAME pass, so there is no gid/text re-matching step at all (the
+  // ambiguity that today's writeSeg has to guard against with a gid-then-text fallback simply doesn't
+  // exist here — every token IS the live node reference it came from).
+  function buildLiveSegmentTemplate(doc) {
+    const pieces = [];
+    const mk = [];
+    const tokenNode = [];
+    let blockCount = 0;
+    doc.forEach((p) => {
+      if (p.type.name !== 'paragraph') return;
+      blockCount++;
+      const parts = [];
+      p.forEach((c) => {
+        if (c.type.name === 'gMarker' || c.type.name === 'xMarker') {
+          const n = mk.length;
+          mk.push({ t: c.type.name === 'gMarker' ? 'g' : 'x', s: norm(c.textContent), gid: c.attrs.gid });
+          tokenNode[n] = c;
+          parts.push('{{' + n + '}}');
+        } else if (c.type.name === 'hardBreak') {
+          parts.push('[[BR]]');
+        } else if (c.text) {
+          parts.push(c.text);
+        }
+      });
+      pieces.push(norm(parts.join(' ')));
+    });
+    return { tp: pieces.join(' [[P]] '), mk, tokenNode, blockCount };
+  }
+
+  // Maps the retranslated response back onto the live doc. Piece count equals live block count by
+  // construction (both came from the same buildLiveSegmentTemplate() call), so this is a direct 1:1
+  // block-to-piece map — no mode detection, no blockG, none of writeSeg's reconciliation machinery,
+  // because there is nothing left to reconcile against a second source. {{n}} and [[BR]] are split in
+  // one combined pass so a hardbreak between/around tokens rebuilds in the right relative position.
+  function writeSegFromLiveTemplate(editor, live, res) {
+    const doc = editor.state.doc, schema = editor.state.schema;
+    const L = res.linkTexts || [];
+    const mk = live.mk, tokenNode = live.tokenNode;
+    const tgParas = res.tmpl.split('[[P]]');
+    if (tgParas.length !== live.blockCount) {
+      throw new Error('RETRANSLATE_PARA_MISMATCH_exp' + live.blockCount + '_got' + tgParas.length);
+    }
+    const edits = [];
+    let blockIdx = 0;
+    doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph') return;
+      const tmplSlice = tgParas[blockIdx];
+      blockIdx++;
+      const content = [];
+      const parts = tmplSlice.split(/(\{\{\d+\}\}|\[\[BR\]\])/);
+      parts.forEach((part) => {
+        if (part === '[[BR]]') {
+          content.push(schema.nodes.hardBreak.create());
+          return;
+        }
+        const tm = part.match(/^\{\{(\d+)\}\}$/);
+        if (tm) {
+          const n = parseInt(tm[1], 10);
+          const m = mk[n];
+          if (!m) throw new Error('RETRANSLATE: token {{' + n + '}} has no matching marker');
+          const node = tokenNode[n];
+          if (m.t === 'g' && L[n] && node.content.size) {
+            content.push(node.type.create(node.attrs, schema.text(L[n]), node.marks));
+          } else {
+            content.push(node);
+          }
+          return;
+        }
+        const text = part.replace(/\s+/g, ' ');
+        if (text) content.push(schema.text(text));
+      });
+      // Whitespace immediately touching a hardBreak is tokenization padding (buildLiveSegmentTemplate
+      // pads [[BR]] with spaces the same way {{n}} tokens are padded, not a real space in the source),
+      // so it's trimmed the same way paragraph edges are below — never left as a stray space glued to
+      // a hard break. Nulled first, spliced out in a second pass so removing one doesn't shift the
+      // index of a hardBreak still to be checked in this same loop.
+      for (let ci = 0; ci < content.length; ci++) {
+        if (!content[ci] || content[ci].type.name !== 'hardBreak') continue;
+        const prev = content[ci - 1];
+        if (prev && prev.type.name === 'text') {
+          const trimmed = prev.text.replace(/\s+$/, '');
+          content[ci - 1] = trimmed ? schema.text(trimmed) : null;
+        }
+        const next = content[ci + 1];
+        if (next && next.type.name === 'text') {
+          const trimmed = next.text.replace(/^\s+/, '');
+          content[ci + 1] = trimmed ? schema.text(trimmed) : null;
+        }
+      }
+      for (let ci = content.length - 1; ci >= 0; ci--) {
+        if (content[ci] === null) content.splice(ci, 1);
+      }
+      // Same empty-edge-trim logic as writeSeg (see its own comment) — a trim that empties a piece must
+      // be removed outright, never rebuilt via schema.text('').
+      if (content.length && content[0].type.name === 'text') {
+        const trimmedStart = content[0].text.replace(/^\s+/, '');
+        if (trimmedStart) content[0] = schema.text(trimmedStart);
+        else content.shift();
+      }
+      if (content.length && content[content.length - 1].type.name === 'text') {
+        const li = content.length - 1;
+        const trimmedEnd = content[li].text.replace(/\s+$/, '');
+        if (trimmedEnd) content[li] = schema.text(trimmedEnd);
+        else content.pop();
+      }
+      edits.push({ from: off + 1, to: off + 1 + p.content.size, content });
+    });
+    edits.sort((a, b) => b.from - a.from);
+    let tr = editor.state.tr;
+    edits.forEach((e) => { tr = tr.replaceWith(e.from, e.to, e.content); });
+    editor.view.dispatch(tr);
+    let cnt = 0;
+    editor.state.doc.descendants((n) => { if (n.type.name === 'gMarker' || n.type.name === 'xMarker') cnt++; });
+    return { edits: edits.length, markersBefore: tokenNode.length, markersAfter: cnt };
+  }
+
+  // One-shot orchestration: build the live template, re-translate just this segment (reusing
+  // translateBatchWithRetry()'s existing corrective-retry loop unchanged), then rewrite. Sentinel index
+  // -1 can never collide with a real segment index (those are always >= 0 array offsets into state.it),
+  // but translateBatchWithRetry() still writes to state.ai.failed[-1] on its own final failed attempt —
+  // cleaned up explicitly below either way, so a retry failure can never linger in state.ai.failed and
+  // pollute wpml.ai.status()'s count or a later wpml.ai.retryFailed() call with a sentinel no real
+  // segment will ever match.
+  const RETRY_I = -1;
+  async function retranslateAndWrite(editor) {
+    let live;
+    try {
+      live = buildLiveSegmentTemplate(editor.state.doc);
+    } catch (e) {
+      return { ok: false, code: 'RETRANSLATE_BUILD_ERROR: ' + e.message };
+    }
+    let outputs;
+    try {
+      outputs = await translateBatchWithRetry([{ i: RETRY_I, tp: live.tp, mk: live.mk, paraCount: live.blockCount }]);
+    } catch (e) {
+      delete state.ai.failed[RETRY_I];
+      return { ok: false, code: 'RETRANSLATE_AI_ERROR: ' + e.message };
+    }
+    const out = outputs[RETRY_I];
+    const failReason = state.ai.failed[RETRY_I];
+    delete state.ai.failed[RETRY_I];
+    if (!out) {
+      return { ok: false, code: 'RETRANSLATE_FAILED_' + (failReason || 'unknown') };
+    }
+    let result;
+    try {
+      result = writeSegFromLiveTemplate(editor, live, out);
+    } catch (e) {
+      return { ok: false, code: 'RETRANSLATE_WRITE_ERROR: ' + e.message };
+    }
+    return { ok: true, result };
+  }
+
   // ---------- translate one segment ----------
   async function doOne(idx, tmplEs, linkTexts) {
     const meta = state.it[idx];
@@ -729,13 +917,23 @@
     // TipTap write path — see writeSeg() above for what's tested vs. flagged. TinyMCE is completely
     // unaffected: everything below this block is the original, unchanged TinyMCE route.
     if (ed.kind === 'tiptap') {
-      let result;
+      let result, fromRetry = false;
       try {
         result = writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts });
       } catch (e) {
-        return 'TIPTAP_WRITE_ERROR: ' + e.message;
+        if (!isRetryableWriteError(e.message)) return 'TIPTAP_WRITE_ERROR: ' + e.message;
+        const retry = await retranslateAndWrite(ed.raw);
+        if (!retry.ok) return retry.code;
+        result = retry.result;
+        fromRetry = true;
       }
-      if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
+      if (result.markersAfter !== result.markersBefore) {
+        if (fromRetry) return 'MARKER_LOST'; // retry's own output still lost a marker — stop, don't loop
+        const retry = await retranslateAndWrite(ed.raw);
+        if (!retry.ok) return retry.code;
+        result = retry.result;
+        if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
+      }
 
       // Same delayed-overwrite guard as the TinyMCE path below, using TipTap's own getText().
       // Flagged: Carlos's live test closed each segment with Escape, not via closeEditor()'s
@@ -1069,6 +1267,7 @@
     lines.push('3. Translate all other text naturally into ' + cfg.targetLang + '.');
     lines.push('4. Each segment lists "mk": one entry per {{n}} token, in order, as {t, s} (t=marker type, s=marker\'s own text). For each marker: if t is "x", or "s" looks like a URL, phone number, email, or shortcode/code, output null at that position in "linkTexts". If t is "g" and "s" is human-readable text (e.g. a link label), output a natural ' + cfg.targetLang + ' translation of "s" at that position in "linkTexts" instead. "linkTexts" must have exactly one entry per marker, in marker order.');
     lines.push('5. [[P]] is a paragraph break. Keep every [[P]] exactly once, in the same order. Never merge or split paragraphs.');
+    lines.push('6. [[BR]] is a line break within a paragraph. Keep every [[BR]] exactly once, in the same order (it may move relative to surrounding words to fit natural ' + cfg.targetLang + ' grammar, like {{n}} tokens can). Never add, drop, or duplicate one.');
     lines.push('Return ONLY the JSON per the response schema: {"segments": [...]}, one entry per input segment (matching "i"), no commentary.');
     lines.push('');
     if (corrections && Object.keys(corrections).length) {
@@ -1356,6 +1555,11 @@
     const expectedParas = (byIdx[out.i].paraCount || 1) - 1;
     const gotParas = (out.tmpl.match(/\[\[P\]\]/g) || []).length;
     if (gotParas !== expectedParas) return 'PARA_COUNT_MISMATCH_exp' + expectedParas + '_got' + gotParas;
+    // [[BR]] only ever appears in a request built by buildLiveSegmentTemplate() (the live-doc retranslate
+    // escalation) — expectedBr is 0 for every ordinary batch segment, so this is a no-op check there.
+    const expectedBr = (byIdx[out.i].tp.match(/\[\[BR\]\]/g) || []).length;
+    const gotBr = (out.tmpl.match(/\[\[BR\]\]/g) || []).length;
+    if (gotBr !== expectedBr) return 'BR_COUNT_MISMATCH_exp' + expectedBr + '_got' + gotBr;
     const lt = out.linkTexts || [];
     if (lt.length !== expected) return 'LINKTEXTS_LENGTH_MISMATCH_exp' + expected + '_got' + lt.length;
     return null;
