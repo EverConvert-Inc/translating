@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.3
+// @version      4.4
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -438,6 +438,26 @@
     return false;
   }
 
+  // findLiveEditor() requires non-empty text by design (needed elsewhere — e.g. closeEditor() relies
+  // on it going falsy to confirm a close) so it can never be the thing that notices a mounted-but-
+  // empty editor. This is the same mount check minus the text requirement, used only to decide whether
+  // to click "copy original" below.
+  function findMountedEditorNode() {
+    const nodes = document.querySelectorAll('.ProseMirror');
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].editor && nodes[i].editor.isEditable) return true;
+    }
+    if (gWindow.tinymce && gWindow.tinymce.get) {
+      const list = gWindow.tinymce.get();
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        const hidden = typeof e.isHidden === 'function' ? e.isHidden() : false;
+        if (e && typeof e.getContent === 'function' && !hidden && e.initialized) return true;
+      }
+    }
+    return false;
+  }
+
   // Returns a ready editor handle, null if no editor ever appeared, or the string
   // 'EDITOR_NOT_READY' if one appeared but its content never stopped changing within the bound
   // below — doOne() must not write in that last case.
@@ -446,12 +466,23 @@
     if (a) a.click();
     else (el.querySelector('.AT-segment_list__open_translation') || el.querySelector('.AT-segment_list__translation') || el).click();
     let editor = null;
+    let copiedOriginal = false;
     for (let i = 0; i < 45; i++) {
       await sleep(80);
       editor = findLiveEditor();
       if (editor) break;
+      // Confirmed live: on some docs the editor mounts (editable) but the source never auto-loads —
+      // getText() stays empty for 6s+, so findLiveEditor()'s hasText gate never passes and this loop
+      // would otherwise burn its whole budget into NOEDITOR even though the editor is sitting right
+      // there, just blank. Click "copy original" once to load the source, then keep polling exactly as
+      // before — a doc that auto-loads its source never sees copiedOriginal go true, so it's unaffected.
+      if (!copiedOriginal && findMountedEditorNode()) {
+        const copyBtn = document.querySelector('.AT-editor__copy_original');
+        if (copyBtn) copyBtn.click();
+        copiedOriginal = true;
+      }
     }
-    if (!editor) return null;
+    if (!editor) return null; // still empty after copy_original (or no copy_original button found) -> NOEDITOR, same as before
     // Content-stability check: ATE can keep mutating the editor's own initial content for a short
     // window even after findLiveEditor() first reports it ready+non-empty. Require two consecutive
     // reads ~150ms apart to match before trusting it enough to write into — bounded to 3 tries
