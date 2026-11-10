@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.7
+// @version      4.8
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -289,17 +289,64 @@
       const value = findSegmentFiberValue(el, id);
       if (!value || typeof value.original_content !== 'string') return null;
       const parsed = parseOriginalContent(value.original_content, 0);
+      const nested = hasNestedMarker(value.original_content);
       const found = findBlockContainer(tn);
       if (!found || found.blocks.length <= 1) {
-        return { template: parsed.piece, marks: parsed.marks, paraCount: 1 };
+        return { template: parsed.piece, marks: parsed.marks, paraCount: 1, nested };
       }
       const domBlockTexts = Array.prototype.map.call(found.blocks, (b) => norm(b.textContent));
       const pieces = splitTemplateByDomBlocks(parsed.piece, parsed.marks, domBlockTexts);
       if (!pieces) return null; // couldn't align fiber text to DOM blocks — caller falls back to tmpl()
-      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: found.blocks.length };
+      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: found.blocks.length, nested };
     } catch (e) {
       return null;
     }
+  }
+
+  // ---------- live-extract routing (2026-11-10) ----------
+  // A segment whose extracted template can't be trusted is flagged liveExtract at extraction time, left
+  // out of the AI batch, and translated at write time straight from the live editor doc instead
+  // (doOne() -> retranslateAndWrite()). Two triggers:
+  //  - any marker (<g> or <x>) inside a <g> in original_content: parseOriginalContent()'s regex can't
+  //    nest, so labels/weights come out wrong even when the fiber path "succeeds" (confirmed live
+  //    2026-11-10 — a list wrapped in an outer <g> with <g><g>term</g>: …</g> items, and a
+  //    <g><x/></g>); and writeSeg()'s label override rebuilds a g marker as plain text, which would
+  //    delete an x inside it.
+  //  - a template that doesn't hold every {{0..mk.length-1}} exactly once: tmpl()'s DOM fallback numbers
+  //    every chip but only keeps text from findBlockContainer()'s blocks, so chips outside them vanish
+  //    from the template while their mk entries stay (live: "{{3}} [[P]] When To Seek Legal Help", 4 mk).
+  function hasNestedMarker(raw) {
+    const re = /<(\/?)([gx])\b[^>]*?(\/?)>/g;
+    let depth = 0;
+    let m;
+    while ((m = re.exec(raw))) {
+      if (m[1]) {
+        if (m[2] === 'g') depth--;
+      } else {
+        if (depth > 0) return true;
+        if (m[2] === 'g' && !m[3]) depth++;
+      }
+    }
+    return false;
+  }
+  function fiberHasNestedMarker(el, id) {
+    try {
+      const value = findSegmentFiberValue(el, id);
+      return !!(value && typeof value.original_content === 'string' && hasNestedMarker(value.original_content));
+    } catch (e) {
+      return false;
+    }
+  }
+  function templateTokensConsistent(template, markCount) {
+    const seen = new Array(markCount).fill(0);
+    const re = /\{\{(\d+)\}\}/g;
+    let m;
+    while ((m = re.exec(template))) {
+      const n = parseInt(m[1], 10);
+      if (n >= markCount) return false;
+      seen[n]++;
+    }
+    return seen.every((c) => c === 1);
   }
 
   // Splits one flat {{n}}-tokenized template into one piece per DOM block, by walking it as a
@@ -747,44 +794,58 @@
   }
 
   // Walks every top-level paragraph-type block uniformly (heading/list/plain — no distinction, see
-  // above) building a fresh {{n}}/[[BR]]/[[P]] template straight from the live nodes. Marker resolution
-  // and request-building happen in the SAME pass, so there is no gid/text re-matching step at all (the
-  // ambiguity that today's writeSeg has to guard against with a gid-then-text fallback simply doesn't
-  // exist here — every token IS the live node reference it came from).
+  // above), recursing into marker nodes: a gMarker becomes an open/close pair {{n}}…{{/n}} with its own
+  // content (text, hardBreaks, nested markers) written inline between them; an xMarker is a single {{n}}.
+  // Confirmed live 2026-11-10 that gMarker nodes hold inline content (text, or an xMarker), so one {{n}}
+  // plus a separately translated label can't represent them without destroying what's inside. Text is
+  // joined exactly as it sits in the doc (no padding around tokens), so "{{0}}Term{{/0}}: …" keeps the
+  // colon attached. Marker resolution and request-building happen in the SAME pass — every token IS the
+  // live node it came from, no gid/text re-matching.
   function buildLiveSegmentTemplate(doc) {
     const pieces = [];
     const mk = [];
     const tokenNode = [];
     let blockCount = 0;
+    function emit(c, parts) {
+      if (c.type.name === 'gMarker') {
+        const n = mk.length;
+        mk.push({ t: 'g', s: norm(c.textContent), gid: c.attrs.gid });
+        tokenNode[n] = c;
+        parts.push('{{' + n + '}}');
+        c.forEach((k) => emit(k, parts));
+        parts.push('{{/' + n + '}}');
+      } else if (c.type.name === 'xMarker') {
+        const n = mk.length;
+        mk.push({ t: 'x', s: norm(c.textContent), gid: c.attrs.gid });
+        tokenNode[n] = c;
+        parts.push('{{' + n + '}}');
+      } else if (c.type.name === 'hardBreak') {
+        parts.push('[[BR]]');
+      } else if (c.text) {
+        parts.push(c.text);
+      }
+    }
     doc.forEach((p) => {
       if (p.type.name !== 'paragraph') return;
       blockCount++;
       const parts = [];
-      p.forEach((c) => {
-        if (c.type.name === 'gMarker' || c.type.name === 'xMarker') {
-          const n = mk.length;
-          mk.push({ t: c.type.name === 'gMarker' ? 'g' : 'x', s: norm(c.textContent), gid: c.attrs.gid });
-          tokenNode[n] = c;
-          parts.push('{{' + n + '}}');
-        } else if (c.type.name === 'hardBreak') {
-          parts.push('[[BR]]');
-        } else if (c.text) {
-          parts.push(c.text);
-        }
-      });
-      pieces.push(norm(parts.join(' ')));
+      p.forEach((c) => emit(c, parts));
+      pieces.push(norm(parts.join('')));
     });
     return { tp: pieces.join(' [[P]] '), mk, tokenNode, blockCount };
   }
 
   // Maps the retranslated response back onto the live doc. Piece count equals live block count by
   // construction (both came from the same buildLiveSegmentTemplate() call), so this is a direct 1:1
-  // block-to-piece map — no mode detection, no blockG, none of writeSeg's reconciliation machinery,
-  // because there is nothing left to reconcile against a second source. {{n}} and [[BR]] are split in
-  // one combined pass so a hardbreak between/around tokens rebuilds in the right relative position.
+  // block-to-piece map — no mode detection, no blockG, none of writeSeg's reconciliation machinery.
+  // Each piece is read left to right with a stack of open markers: text -> text node, [[BR]] ->
+  // hardBreak, an x token -> its live node unchanged, {{n}} opens a gMarker, {{/n}} closes it by
+  // rebuilding that marker around the translated children (node.type.create(attrs, children, marks)),
+  // so a nested xMarker/gMarker inside it survives. linkTexts are not used here: a g marker's text is
+  // translated inline between its pair, never via a separate label. Pair order/nesting was already
+  // validated against the source template (validateAiSegment); the stack checks here are a backstop.
   function writeSegFromLiveTemplate(editor, live, res) {
     const doc = editor.state.doc, schema = editor.state.schema;
-    const L = res.linkTexts || [];
     const mk = live.mk, tokenNode = live.tokenNode;
     const tgParas = res.tmpl.split('[[P]]');
     if (tgParas.length !== live.blockCount) {
@@ -796,34 +857,39 @@
       if (p.type.name !== 'paragraph') return;
       const tmplSlice = tgParas[blockIdx];
       blockIdx++;
-      const content = [];
-      const parts = tmplSlice.split(/(\{\{\d+\}\}|\[\[BR\]\])/);
+      const stack = [{ n: null, children: [] }];
+      const parts = tmplSlice.split(/(\{\{\/?\d+\}\}|\[\[BR\]\])/);
       parts.forEach((part) => {
+        const top = stack[stack.length - 1];
         if (part === '[[BR]]') {
-          content.push(schema.nodes.hardBreak.create());
+          top.children.push(schema.nodes.hardBreak.create());
           return;
         }
-        const tm = part.match(/^\{\{(\d+)\}\}$/);
+        const tm = part.match(/^\{\{(\/?)(\d+)\}\}$/);
         if (tm) {
-          const n = parseInt(tm[1], 10);
+          const n = parseInt(tm[2], 10);
           const m = mk[n];
           if (!m) throw new Error('RETRANSLATE: token {{' + n + '}} has no matching marker');
           const node = tokenNode[n];
-          if (m.t === 'g' && L[n] && node.content.size) {
-            content.push(node.type.create(node.attrs, schema.text(L[n]), node.marks));
-          } else {
-            content.push(node);
+          if (tm[1]) {
+            if (top.n !== n) throw new Error('RETRANSLATE: {{/' + n + '}} closes out of order');
+            stack.pop();
+            stack[stack.length - 1].children.push(top.children.length ? node.type.create(node.attrs, top.children, node.marks) : node);
+            return;
           }
+          if (m.t === 'x') top.children.push(node);
+          else stack.push({ n, children: [] });
           return;
         }
         const text = part.replace(/\s+/g, ' ');
-        if (text) content.push(schema.text(text));
+        if (text) top.children.push(schema.text(text));
       });
-      // Whitespace immediately touching a hardBreak is tokenization padding (buildLiveSegmentTemplate
-      // pads [[BR]] with spaces the same way {{n}} tokens are padded, not a real space in the source),
-      // so it's trimmed the same way paragraph edges are below — never left as a stray space glued to
-      // a hard break. Nulled first, spliced out in a second pass so removing one doesn't shift the
-      // index of a hardBreak still to be checked in this same loop.
+      if (stack.length !== 1) throw new Error('RETRANSLATE: {{' + stack[stack.length - 1].n + '}} never closed');
+      const content = stack[0].children;
+      // The AI may put spaces around [[BR]] that aren't in the source — trimmed the same way paragraph
+      // edges are below, so a hard break never ends up with a stray space glued to it. Nulled first,
+      // spliced out in a second pass so removing one doesn't shift the index of a hardBreak still to be
+      // checked in this same loop.
       for (let ci = 0; ci < content.length; ci++) {
         if (!content[ci] || content[ci].type.name !== 'hardBreak') continue;
         const prev = content[ci - 1];
@@ -924,7 +990,7 @@
   async function doOne(idx, tmplEs, linkTexts) {
     const meta = state.it[idx];
     if (!meta) return 'NOMETA';
-    if (isSlugSegment(meta)) {
+    if (tmplEs != null && isSlugSegment(meta)) {
       tmplEs = slugify(tmplEs);
       if (!tmplEs) return 'SLUG_EMPTY';
     }
@@ -941,22 +1007,28 @@
     // unaffected: everything below this block is the original, unchanged TinyMCE route.
     if (ed.kind === 'tiptap') {
       let result, fromRetry = false;
-      try {
-        result = writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts });
-      } catch (e) {
-        if (!isRetryableWriteError(e.message)) return 'TIPTAP_WRITE_ERROR: ' + e.message;
+      if (tmplEs == null) {
+        // liveExtract segment (queued by queueLiveSegments() with no batch template): its extracted
+        // template couldn't be trusted, so translate it straight from the live doc.
         const retry = await retranslateAndWrite(ed.raw);
         if (!retry.ok) return retry.code;
         result = retry.result;
         fromRetry = true;
+      } else {
+        try {
+          result = writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts });
+        } catch (e) {
+          if (!isRetryableWriteError(e.message)) return 'TIPTAP_WRITE_ERROR: ' + e.message;
+          const retry = await retranslateAndWrite(ed.raw);
+          if (!retry.ok) return retry.code;
+          result = retry.result;
+          fromRetry = true;
+        }
       }
-      if (result.markersAfter !== result.markersBefore) {
-        if (fromRetry) return 'MARKER_LOST'; // retry's own output still lost a marker — stop, don't loop
-        const retry = await retranslateAndWrite(ed.raw);
-        if (!retry.ok) return retry.code;
-        result = retry.result;
-        if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
-      }
+      // No retry on a marker loss: the lossy write has already been dispatched, so a live-doc retry would
+      // rebuild from the damaged doc, count the reduced marker number on both sides, and report OK with
+      // the marker still gone. Report it instead.
+      if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
 
       // Same delayed-overwrite guard as the TinyMCE path below, using TipTap's own getText().
       // Flagged: Carlos's live test closed each segment with Escape, not via closeEditor()'s
@@ -970,6 +1042,10 @@
       }
       return 'OK';
     }
+
+    // The live-doc path needs a ProseMirror doc; TinyMCE has none, and a liveExtract segment's extracted
+    // template is known-broken, so fail loud rather than write it.
+    if (tmplEs == null) return 'LIVE_EXTRACT_TIPTAP_ONLY';
 
     const d = document.createElement('div');
     d.innerHTML = ed.getHTML();
@@ -1110,12 +1186,14 @@
           // tryFiberExtract() above); DOM-based tmpl() only as a fallback, logged when it's used so a
           // page where fiber lookup never works isn't silently missing markers again.
           let t = tryFiberExtract(items[i], id, tn);
+          let nested = t ? t.nested : false;
           if (!t) {
             if (!fiberFallbackWarned[id]) {
               fiberFallbackWarned[id] = true;
               logRetryWarn('extract fiber lookup failed, using DOM fallback', 'segment ' + id);
             }
             t = tmpl(tn);
+            nested = fiberHasNestedMarker(items[i], id);
           }
           const add = items[i].querySelector('.AT-segment_list__add_translation_button');
           // Same check startVerify() uses to flag "english" after the fact — applied here too so a
@@ -1130,6 +1208,7 @@
             tp: t.template,
             mk: t.marks,
             paraCount: t.paraCount,
+            liveExtract: nested || !templateTokensConsistent(t.template, t.marks.length),
             need: !!add || stuckEnglish,
           };
           if (seen[id] == null) {
@@ -1247,7 +1326,7 @@
     const ex = new Set(state.ai.config.exclude || []);
     const out = [];
     for (let i = 0; i < state.it.length; i++) {
-      if (!state.it[i].need || ex.has(i)) continue;
+      if (!state.it[i].need || ex.has(i) || state.it[i].liveExtract) continue; // liveExtract: see queueLiveSegments()
       const tp = isSlugSegment(state.it[i]) ? state.it[i].tp.replace(/-/g, ' ') : state.it[i].tp;
       out.push({ i, tp, mk: state.it[i].mk, paraCount: state.it[i].paraCount });
     }
@@ -1292,6 +1371,7 @@
     lines.push('4. Each segment lists "mk": one entry per {{n}} token, in order, as {t, s} (t=marker type, s=marker\'s own text). For each marker: if t is "x", or "s" looks like a URL, phone number, email, or shortcode/code, output null at that position in "linkTexts". If t is "g" and "s" is human-readable text (e.g. a link label), output a natural ' + cfg.targetLang + ' translation of "s" at that position in "linkTexts" instead. "linkTexts" must have exactly one entry per marker, in marker order.');
     lines.push('5. [[P]] is a paragraph break. Keep every [[P]] exactly once, in the same order. Never merge or split paragraphs.');
     lines.push('6. [[BR]] is a line break within a paragraph. Keep every [[BR]] exactly once, in the same order (it may move relative to surrounding words to fit natural ' + cfg.targetLang + ' grammar, like {{n}} tokens can). Never add, drop, or duplicate one.');
+    lines.push('7. Some segments write a marker as a pair {{n}}…{{/n}} around text. Keep both tokens exactly once, the opening one first. Translate the text between them in place. Every token that sits inside a pair must stay inside that same pair (keep the nesting exactly); you may move a whole pair within its sentence. For a paired marker, output null at its position in "linkTexts" — its text is translated inline.');
     lines.push('Return ONLY the JSON per the response schema: {"segments": [...]}, one entry per input segment (matching "i"), no commentary.');
     lines.push('');
     if (corrections && Object.keys(corrections).length) {
@@ -1558,6 +1638,41 @@
     return geminiCall(promptText, cfg);
   }
 
+  // Parses {{n}} / {{/n}} / [[P]] tokens into an enclosing-pair map: parent[n] = the pair index that
+  // directly encloses token n (null at top level). knownPairs = which indices are pairs (taken from the
+  // source); null means "whatever closes in this string". Returns an error code string on any
+  // misnesting, a pair crossing [[P]], or a missing/duplicate/unexpected close.
+  function pairTree(str, knownPairs) {
+    const pairs = knownPairs || new Set((str.match(/\{\{\/\d+\}\}/g) || []).map((t) => parseInt(t.slice(3), 10)));
+    const parent = {};
+    const filled = {};
+    const closed = {};
+    const stack = [];
+    const re = /\{\{(\/?)(\d+)\}\}|\[\[P\]\]/g;
+    let m;
+    while ((m = re.exec(str))) {
+      if (m[0] === '[[P]]') {
+        if (stack.length) return 'PAIR_CROSSES_PARA_' + stack[stack.length - 1].n;
+        continue;
+      }
+      const n = parseInt(m[2], 10);
+      if (m[1]) {
+        if (!pairs.has(n)) return 'UNEXPECTED_CLOSE_' + n;
+        if (closed[n]) return 'DUPLICATE_CLOSE_' + n;
+        const top = stack.pop();
+        if (!top || top.n !== n) return 'PAIR_MISNESTED_' + n;
+        closed[n] = true;
+        filled[n] = str.slice(top.end, m.index).replace(/\s+/g, '') !== '';
+      } else {
+        parent[n] = stack.length ? stack[stack.length - 1].n : null;
+        if (pairs.has(n)) stack.push({ n, end: re.lastIndex });
+      }
+    }
+    if (stack.length) return 'UNCLOSED_PAIR_' + stack[stack.length - 1].n;
+    for (const n of pairs) if (!closed[n]) return 'MISSING_CLOSE_' + n;
+    return { pairs, parent, filled };
+  }
+
   function validateAiSegment(out, byIdx) {
     if (!out || typeof out.i !== 'number' || !byIdx[out.i]) return 'UNKNOWN_INDEX';
     if (typeof out.tmpl !== 'string') return 'TMPL_NOT_STRING';
@@ -1584,6 +1699,21 @@
     const expectedBr = (byIdx[out.i].tp.match(/\[\[BR\]\]/g) || []).length;
     const gotBr = (out.tmpl.match(/\[\[BR\]\]/g) || []).length;
     if (gotBr !== expectedBr) return 'BR_COUNT_MISMATCH_exp' + expectedBr + '_got' + gotBr;
+    // Paired {{n}}…{{/n}} markers only ever come from buildLiveSegmentTemplate() — no-op otherwise.
+    // Every token must keep the same enclosing pair it had in the source, and a pair that had content
+    // can't come back empty, so the writer can rebuild the exact same marker nesting.
+    if (byIdx[out.i].tp.indexOf('{{/') !== -1) {
+      const src = pairTree(byIdx[out.i].tp, null);
+      if (typeof src === 'string') return 'SRC_' + src;
+      const tgt = pairTree(out.tmpl, src.pairs);
+      if (typeof tgt === 'string') return tgt;
+      for (const n in src.parent) {
+        if (tgt.parent[n] !== src.parent[n]) return 'PAIR_PARENT_CHANGED_' + n;
+      }
+      for (const n of src.pairs) {
+        if (src.filled[n] && !tgt.filled[n]) return 'EMPTY_PAIR_' + n;
+      }
+    }
     const lt = out.linkTexts || [];
     if (lt.length !== expected) return 'LINKTEXTS_LENGTH_MISMATCH_exp' + expected + '_got' + lt.length;
     return null;
@@ -1644,6 +1774,20 @@
       launchBatch(state.ai.nextLaunch);
       state.ai.nextLaunch++;
     }
+  }
+
+  // liveExtract segments (see hasNestedMarker/templateTokensConsistent) are never in a batch — they're queued
+  // with no template once the batches are queued, and doOne() translates each one from the live doc.
+  // Called only after approval (or straight away when there are no batches at all), so nothing is
+  // written before a human has reviewed batch 1.
+  function queueLiveSegments() {
+    const ex = new Set(state.ai.config.exclude || []);
+    const pairs = [];
+    for (let i = 0; i < state.it.length; i++) {
+      if (state.it[i].need && state.it[i].liveExtract && !ex.has(i)) pairs.push([i, null, null]);
+    }
+    if (pairs.length) api.queue(pairs);
+    return pairs.length;
   }
 
   function queueOutputs(outputs, batch) {
@@ -1755,7 +1899,10 @@
         state.ai.jobs = {};
         state.ai.nextLaunch = 0;
         state.ai.awaitingApproval = false;
-        if (!state.ai.batches.length) return 'nothing to translate';
+        if (!state.ai.batches.length) {
+          const live = queueLiveSegments();
+          return live ? 'no batch segments; queued ' + live + ' live-extract segment(s)' : 'nothing to translate';
+        }
         const first = state.ai.batches[0];
         let outputs;
         try {
@@ -1823,7 +1970,9 @@
           nextQueue++;
           primeJobs(); // keep the pipeline topped up to cap as each batch is consumed
         }
-        return 'queued all batches. Failed segments: ' + Object.keys(state.ai.failed).length + ' (see wpml.ai.status())';
+        const live = queueLiveSegments();
+        return 'queued all batches' + (live ? ' + ' + live + ' live-extract segment(s)' : '') +
+          '. Failed segments: ' + Object.keys(state.ai.failed).length + ' (see wpml.ai.status())';
       } finally {
         state.ai.running = false;
       }
