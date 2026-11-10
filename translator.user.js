@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.8
+// @version      4.9
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -540,10 +540,31 @@
       await sleep(150);
       editor = findLiveEditor() || editor;
       const cur = editor.getHTML();
-      if (cur === prev) return editor;
+      if (cur === prev) {
+        editor.copiedOriginal = copiedOriginal;
+        return editor;
+      }
       prev = cur;
     }
+    editor.copiedOriginal = copiedOriginal;
+    clearCopiedSource(editor);
     return 'EDITOR_NOT_READY';
+  }
+
+  // Undoes a copy_original that didn't lead to a successful write, so WPML saves the segment as
+  // untranslated when the editor closes instead of saving the copied English source as its
+  // "translation" (seen live 2026-11-10: a failed segment ended up English). Only acts on a handle
+  // whose content openEditor() itself loaded via copy_original — a segment that already had a
+  // translation when opened is never cleared. Not yet verified live that WPML treats an emptied
+  // editor as untranslated.
+  function clearCopiedSource(ed) {
+    if (!ed || !ed.copiedOriginal) return;
+    try {
+      if (ed.kind === 'tiptap') ed.raw.commands.clearContent(true);
+      else ed.setHTML('');
+    } catch (e) {
+      // best effort — the failure code is still reported either way
+    }
   }
 
   // ---------- state ----------
@@ -1006,29 +1027,29 @@
     // TipTap write path — see writeSeg() above for what's tested vs. flagged. TinyMCE is completely
     // unaffected: everything below this block is the original, unchanged TinyMCE route.
     if (ed.kind === 'tiptap') {
-      let result, fromRetry = false;
+      // Every failure return below clears a copy_original'd source first (see clearCopiedSource).
+      const fail = (code) => { clearCopiedSource(ed); return code; };
+      let result;
       if (tmplEs == null) {
         // liveExtract segment (queued by queueLiveSegments() with no batch template): its extracted
         // template couldn't be trusted, so translate it straight from the live doc.
         const retry = await retranslateAndWrite(ed.raw);
-        if (!retry.ok) return retry.code;
+        if (!retry.ok) return fail(retry.code);
         result = retry.result;
-        fromRetry = true;
       } else {
         try {
           result = writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts });
         } catch (e) {
-          if (!isRetryableWriteError(e.message)) return 'TIPTAP_WRITE_ERROR: ' + e.message;
+          if (!isRetryableWriteError(e.message)) return fail('TIPTAP_WRITE_ERROR: ' + e.message);
           const retry = await retranslateAndWrite(ed.raw);
-          if (!retry.ok) return retry.code;
+          if (!retry.ok) return fail(retry.code);
           result = retry.result;
-          fromRetry = true;
         }
       }
       // No retry on a marker loss: the lossy write has already been dispatched, so a live-doc retry would
       // rebuild from the damaged doc, count the reduced marker number on both sides, and report OK with
       // the marker still gone. Report it instead.
-      if (result.markersAfter !== result.markersBefore) return 'MARKER_LOST';
+      if (result.markersAfter !== result.markersBefore) return fail('MARKER_LOST');
 
       // Same delayed-overwrite guard as the TinyMCE path below, using TipTap's own getText().
       // Flagged: Carlos's live test closed each segment with Escape, not via closeEditor()'s
@@ -1045,7 +1066,10 @@
 
     // The live-doc path needs a ProseMirror doc; TinyMCE has none, and a liveExtract segment's extracted
     // template is known-broken, so fail loud rather than write it.
-    if (tmplEs == null) return 'LIVE_EXTRACT_TIPTAP_ONLY';
+    if (tmplEs == null) {
+      clearCopiedSource(ed);
+      return 'LIVE_EXTRACT_TIPTAP_ONLY';
+    }
 
     const d = document.createElement('div');
     d.innerHTML = ed.getHTML();
@@ -1156,7 +1180,12 @@
     try {
       while (state.q.length) {
         const t = state.q.shift();
-        state.run.results.push(t[0] + ':' + (await doOne(t[0], t[1], t[2])));
+        // A queue item with no template is a live-extract segment — its progress is mirrored into
+        // state.ai.live so wpml.ai.status() shows it while running, not only after it finishes.
+        if (t[1] == null) state.ai.live[t[0]] = 'running';
+        const res = await doOne(t[0], t[1], t[2]);
+        if (t[1] == null) state.ai.live[t[0]] = res;
+        state.run.results.push(t[0] + ':' + res);
         state.run.done++;
       }
       await closeEditor();
@@ -1314,6 +1343,7 @@
     batchIndex: 0,
     results: {},
     failed: {},
+    live: {}, // live-extract segment index -> 'queued' | 'running' | final doOne() code, see drain()
     awaitingApproval: false,
     running: false,
     lastError: null,
@@ -1784,7 +1814,10 @@
     const ex = new Set(state.ai.config.exclude || []);
     const pairs = [];
     for (let i = 0; i < state.it.length; i++) {
-      if (state.it[i].need && state.it[i].liveExtract && !ex.has(i)) pairs.push([i, null, null]);
+      if (state.it[i].need && state.it[i].liveExtract && !ex.has(i)) {
+        pairs.push([i, null, null]);
+        state.ai.live[i] = 'queued';
+      }
     }
     if (pairs.length) api.queue(pairs);
     return pairs.length;
@@ -1896,6 +1929,7 @@
         state.ai.batchIndex = 0;
         state.ai.results = {};
         state.ai.failed = {};
+        state.ai.live = {};
         state.ai.jobs = {};
         state.ai.nextLaunch = 0;
         state.ai.awaitingApproval = false;
@@ -2011,6 +2045,8 @@
         batchesTotal: state.ai.batches.length,
         translated: Object.keys(state.ai.results).length,
         failed: state.ai.failed,
+        // live-extract segments: index -> 'queued' | 'running' | the final doOne() code ('OK' or an error)
+        live: state.ai.live,
         lastError: state.ai.lastError,
       };
     },
@@ -2343,14 +2379,58 @@
     // open editor, splice content, save) can still be running well after approve()'s promise
     // settles. Calling verify() before drain() is idle would scroll-scan a page mid-edit AND risk
     // two things fighting over the same scroller/tinymce state at once.
-    function waitForDrainIdle(timeoutMs) {
+    // How long the drain may go without ANY sign of progress before the panel stops watching. Not a
+    // total-time cap: a full page plus live-extract segments (each one an extra AI call, worst case
+    // ~105s of 429 backoff) can legitimately run many minutes. A completed write, a queue change, a
+    // live-status change, or a new retry-log entry each reset the clock. Replaces a fixed 120s total
+    // that gave up while a live-extract segment was still mid-write (seen live 2026-11-10).
+    const DRAIN_STALL_MS = 240000;
+    function drainFingerprint() {
+      const lastLog = state.errorLog.length ? state.errorLog[state.errorLog.length - 1].t : 0;
+      return state.run.done + '|' + state.q.length + '|' + JSON.stringify(state.ai.live) + '|' + lastLog;
+    }
+    function waitForDrainIdle(stallMs) {
       return new Promise((resolve, reject) => {
-        const start = Date.now();
+        let last = drainFingerprint();
+        let lastChange = Date.now();
         const iv = setInterval(() => {
-          if (!state.run.active && state.q.length === 0) { clearInterval(iv); resolve(); }
-          else if (Date.now() - start > timeoutMs) { clearInterval(iv); reject(new Error('timed out waiting for segment queue to drain')); }
+          if (!state.run.active && state.q.length === 0) { clearInterval(iv); resolve(); return; }
+          const fp = drainFingerprint();
+          if (fp !== last) {
+            last = fp;
+            lastChange = Date.now();
+          } else if (Date.now() - lastChange > stallMs) {
+            clearInterval(iv);
+            reject(new Error('segment queue made no progress for ' + Math.round(stallMs / 1000) +
+              's — it may still be running; check wpml.prog() before refreshing'));
+          }
         }, 400);
       });
+    }
+
+    function liveSummary() {
+      const live = api.ai.status().live || {};
+      const idxs = Object.keys(live);
+      return idxs.length ? 'Live-extract: ' + idxs.map((i) => '#' + i + ' ' + live[i]).join(', ') : '';
+    }
+
+    // Like startElapsedTicker, but shows write progress and each live-extract segment's status while
+    // the queue drains. Same re-append guard: pollRetryFeedback's textContent += wipes child nodes.
+    function startDrainTicker(targetEl) {
+      const start = Date.now();
+      const el = document.createElement('div');
+      el.className = 'whp-elapsed-tick';
+      el.style.whiteSpace = 'pre-wrap';
+      const render = () => {
+        if (!el.isConnected) targetEl.appendChild(el);
+        const p = api.prog();
+        const live = liveSummary();
+        el.textContent = 'Writes ' + p.done + '/' + p.total + ' · ' + Math.round((Date.now() - start) / 1000) + 's' +
+          (live ? '\n' + live : '');
+      };
+      render();
+      const iv = setInterval(render, 1000);
+      return () => { clearInterval(iv); el.remove(); };
     }
 
     // A 429 retry backs off 15s/30s/60s (~105s worst case, see retryDelayMs above) entirely inside
@@ -2399,6 +2479,31 @@
     // button then reads as "Approve & Finish" for the second click, which approves the rest and
     // auto-verifies. Every step below calls an existing api.*/api.ai.* method; nothing new is
     // invented except the auto-exclude text match and the wait/phase bookkeeping around them.
+    // Shared tail for both phases: wait for every queued write — live-extract segments included — to
+    // finish, then verify. Phase 1 needs it too: with no AI batches, translate() queues live-extract
+    // segments and returns at once, and the panel used to stop there while they were still running.
+    async function finishRun(headerText) {
+      translatePageResultEl.textContent = headerText + '\n\nFinishing queued writes…';
+      const stopFeedback = pollRetryFeedback(translatePageResultEl);
+      const stopTicker = startDrainTicker(translatePageResultEl);
+      try {
+        await waitForDrainIdle(DRAIN_STALL_MS);
+      } finally {
+        stopFeedback();
+        stopTicker();
+      }
+      translatePageResultEl.textContent = headerText + '\n\nVerifying…';
+      const prevVJob = state.vJob;
+      api.verify();
+      await waitForNewJobDone(() => state.vJob, prevVJob, 90000);
+      const v = api.vprog();
+      const clean = !v.missing.length && !v.english.length && !v.markerLost.length;
+      const live = liveSummary();
+      translatePageResultEl.textContent = headerText + (live ? '\n' + live : '') +
+        '\n\nVerify: missing=' + v.missing.length + ' english=' + v.english.length + ' markerLost=' + v.markerLost.length +
+        (clean ? '\n(all clean)' : '\n(needs manual cleanup — see wpml.vprog() / Actions for details)');
+    }
+
     translatePageBtn.addEventListener('click', async () => {
       translatePageBtn.disabled = true;
       try {
@@ -2422,6 +2527,7 @@
           translatePageResultEl.textContent += '\n' + result;
           renderPreview();
           if (api.ai.status().awaitingApproval) setTranslatePagePhase(2);
+          else if (state.run.active || state.q.length) await finishRun(translatePageResultEl.textContent); // live-extract segments only
         } else {
           translatePageResultEl.textContent = 'Approving remaining batches…';
           const stopFeedback = pollRetryFeedback(translatePageResultEl);
@@ -2432,17 +2538,7 @@
             // stays on phase 2 — clicking "Approve & Finish" again resumes from the failed batch (v1.4 behavior)
             return;
           }
-          translatePageResultEl.textContent += '\n\nFinishing queued writes…';
-          await waitForDrainIdle(120000);
-          translatePageResultEl.textContent += '\n\nVerifying…';
-          const prevVJob = state.vJob;
-          api.verify();
-          await waitForNewJobDone(() => state.vJob, prevVJob, 90000);
-          const v = api.vprog();
-          const clean = !v.missing.length && !v.english.length && !v.markerLost.length;
-          translatePageResultEl.textContent = approveResult +
-            '\n\nVerify: missing=' + v.missing.length + ' english=' + v.english.length + ' markerLost=' + v.markerLost.length +
-            (clean ? '\n(all clean)' : '\n(needs manual cleanup — see wpml.vprog() / Actions for details)');
+          await finishRun(approveResult);
           setTranslatePagePhase(1);
         }
       } catch (e) {
