@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.9
+// @version      4.10
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -30,7 +30,7 @@
     ])
     wpml.prog()                // {done, total, active, queue, bad}
     wpml.verify()              // scroll-verify all segments. Wait ~15s.
-    wpml.vprog()               // {done, total, missing, english, markerLost}
+    wpml.vprog()               // {done, total, missing, english, markerLost, manual}
     wpml.fixMk(idx, N)         // patch a segment's mk length after MARKER_MISMATCH_expN_gotM
 
   AI USAGE — after wpml.extract(). Provider defaults to Gemini; switch to Claude via config():
@@ -290,14 +290,15 @@
       if (!value || typeof value.original_content !== 'string') return null;
       const parsed = parseOriginalContent(value.original_content, 0);
       const nested = hasNestedMarker(value.original_content);
+      const oc = value.original_content;
       const found = findBlockContainer(tn);
       if (!found || found.blocks.length <= 1) {
-        return { template: parsed.piece, marks: parsed.marks, paraCount: 1, nested };
+        return { template: parsed.piece, marks: parsed.marks, paraCount: 1, nested, oc };
       }
       const domBlockTexts = Array.prototype.map.call(found.blocks, (b) => norm(b.textContent));
       const pieces = splitTemplateByDomBlocks(parsed.piece, parsed.marks, domBlockTexts);
       if (!pieces) return null; // couldn't align fiber text to DOM blocks — caller falls back to tmpl()
-      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: found.blocks.length, nested };
+      return { template: pieces.join(' [[P]] '), marks: parsed.marks, paraCount: found.blocks.length, nested, oc };
     } catch (e) {
       return null;
     }
@@ -329,13 +330,74 @@
     }
     return false;
   }
-  function fiberHasNestedMarker(el, id) {
+  function fiberOriginalContent(el, id) {
     try {
       const value = findSegmentFiberValue(el, id);
-      return !!(value && typeof value.original_content === 'string' && hasNestedMarker(value.original_content));
+      return value && typeof value.original_content === 'string' ? value.original_content : null;
     } catch (e) {
-      return false;
+      return null;
     }
+  }
+
+  // Segments the guard below refused to write, from this session's write results, as
+  // "index (seg id): BLOCK_MISALIGNED: …". Listed in vprog() directly because a cleared segment only
+  // shows up there as "missing" if WPML treats the emptied editor as untranslated (unconfirmed).
+  function manualSegments() {
+    return state.run.results
+      .filter((r) => r.indexOf(':BLOCK_MISALIGNED') !== -1)
+      .map((r) => {
+        const i = parseInt(r, 10);
+        return i + ' (seg ' + (state.it[i] ? state.it[i].id : '?') + '): ' + r.slice(r.indexOf(':') + 1);
+      });
+  }
+
+  // ---------- block misalignment guard (2026-11-10) ----------
+  // Confirmed live (segment 9807444226): WPML's TipTap editor puts block formatting on each top-level
+  // <p> as DOM attributes (data-block-tag / data-paragraph-gid, plugin "paragraphBlockTag"), assigned
+  // top-down by position — they are not in the ProseMirror doc, so no doc write can set or keep them.
+  // When a segment opens with untagged content before its block-level <g>s, copy_original's paragraphs
+  // and those tags come out shifted (an h2 tag on the image paragraph, the real h2 text in a p, …), and
+  // saving publishes the shift. Before any TipTap write, each tagged paragraph's text is checked against
+  // its own <g> block in original_content; a mismatch means the slots are shifted, so nothing is
+  // written. Only judged while the doc still holds the English source (after copy_original, or a
+  // stuck-English target), since that's the only time its text can be compared to original_content.
+  const PAIRED_X_RE = /<x\b[^>]*[^/]>[\s\S]*?<\/x>/g;
+  function gInnerText(oc, gid) {
+    const open = new RegExp('<g\\s+id="' + gid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"[^>]*>');
+    const m = open.exec(oc);
+    if (!m) return null;
+    const re = /<(\/?)g\b[^>]*?(\/?)>/g;
+    re.lastIndex = m.index + m[0].length;
+    let depth = 1;
+    let t;
+    while ((t = re.exec(oc))) {
+      if (t[1]) {
+        if (--depth === 0) break;
+      } else if (!t[2]) {
+        depth++;
+      }
+    }
+    if (!t) return null;
+    return norm(decodeEntities(oc.slice(m.index + m[0].length, t.index).replace(PAIRED_X_RE, '')));
+  }
+  function findBlockMisalignment(editor, oc) {
+    if (!oc) return null;
+    const strip = (s) => s.replace(/\s+/g, '');
+    let docText = '';
+    editor.state.doc.forEach((p) => { docText += p.textContent; });
+    if (strip(docText) !== strip(decodeEntities(oc.replace(PAIRED_X_RE, '')))) return null; // not the English source
+    const bad = [];
+    let idx = 0;
+    editor.state.doc.forEach((p, off) => {
+      const i = idx++;
+      if (p.type.name !== 'paragraph') return;
+      const dom = editor.view.nodeDOM(off);
+      const gid = dom && dom.getAttribute ? dom.getAttribute('data-paragraph-gid') : null;
+      if (!gid) return;
+      const expected = gInnerText(oc, gid);
+      if (expected != null && norm(p.textContent) !== expected) bad.push('p' + i + '=' + gid);
+    });
+    return bad.length ? bad.join(',') : null;
   }
   function templateTokensConsistent(template, markCount) {
     const seen = new Array(markCount).fill(0);
@@ -1029,6 +1091,8 @@
     if (ed.kind === 'tiptap') {
       // Every failure return below clears a copy_original'd source first (see clearCopiedSource).
       const fail = (code) => { clearCopiedSource(ed); return code; };
+      const misaligned = findBlockMisalignment(ed.raw, meta.oc);
+      if (misaligned) return fail('BLOCK_MISALIGNED: ' + misaligned);
       let result;
       if (tmplEs == null) {
         // liveExtract segment (queued by queueLiveSegments() with no batch template): its extracted
@@ -1216,13 +1280,15 @@
           // page where fiber lookup never works isn't silently missing markers again.
           let t = tryFiberExtract(items[i], id, tn);
           let nested = t ? t.nested : false;
+          let oc = t ? t.oc : null;
           if (!t) {
             if (!fiberFallbackWarned[id]) {
               fiberFallbackWarned[id] = true;
               logRetryWarn('extract fiber lookup failed, using DOM fallback', 'segment ' + id);
             }
             t = tmpl(tn);
-            nested = fiberHasNestedMarker(items[i], id);
+            oc = fiberOriginalContent(items[i], id);
+            nested = !!oc && hasNestedMarker(oc);
           }
           const add = items[i].querySelector('.AT-segment_list__add_translation_button');
           // Same check startVerify() uses to flag "english" after the fact — applied here too so a
@@ -1238,6 +1304,7 @@
             mk: t.marks,
             paraCount: t.paraCount,
             liveExtract: nested || !templateTokensConsistent(t.template, t.marks.length),
+            oc, // original_content, for findBlockMisalignment() at write time (null if the fiber lookup failed)
             need: !!add || stuckEnglish,
           };
           if (seen[id] == null) {
@@ -1890,7 +1957,7 @@
     vprog() {
       const v = state.vJob;
       if (!v) return 'no verify yet';
-      return { done: v.done, total: v.total, missing: v.missing, english: v.english, markerLost: v.markerLost };
+      return { done: v.done, total: v.total, missing: v.missing, english: v.english, markerLost: v.markerLost, manual: manualSegments() };
     },
     // low-level access for debugging
     _state: state,
@@ -2497,10 +2564,11 @@
       api.verify();
       await waitForNewJobDone(() => state.vJob, prevVJob, 90000);
       const v = api.vprog();
-      const clean = !v.missing.length && !v.english.length && !v.markerLost.length;
+      const clean = !v.missing.length && !v.english.length && !v.markerLost.length && !v.manual.length;
       const live = liveSummary();
       translatePageResultEl.textContent = headerText + (live ? '\n' + live : '') +
         '\n\nVerify: missing=' + v.missing.length + ' english=' + v.english.length + ' markerLost=' + v.markerLost.length +
+        (v.manual.length ? '\nNeeds manual translation (WPML block misalignment):\n  ' + v.manual.join('\n  ') : '') +
         (clean ? '\n(all clean)' : '\n(needs manual cleanup — see wpml.vprog() / Actions for details)');
     }
 
