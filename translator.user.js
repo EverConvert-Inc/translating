@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.10
+// @version      4.11
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -30,7 +30,7 @@
     ])
     wpml.prog()                // {done, total, active, queue, bad}
     wpml.verify()              // scroll-verify all segments. Wait ~15s.
-    wpml.vprog()               // {done, total, missing, english, markerLost, manual}
+    wpml.vprog()               // {done, total, missing, english, markerLost, manual, realigned}
     wpml.fixMk(idx, N)         // patch a segment's mk length after MARKER_MISMATCH_expN_gotM
 
   AI USAGE — after wpml.extract(). Provider defaults to Gemini; switch to Claude via config():
@@ -339,12 +339,13 @@
     }
   }
 
-  // Segments the guard below refused to write, from this session's write results, as
-  // "index (seg id): BLOCK_MISALIGNED: …". Listed in vprog() directly because a cleared segment only
-  // shows up there as "missing" if WPML treats the emptied editor as untranslated (unconfirmed).
-  function manualSegments() {
+  // This session's write results carrying a given code, as "index (seg id): CODE…". vprog() lists
+  // BLOCK_MISALIGNED ones (refused, needs manual) directly, because a cleared segment only shows up as
+  // "missing" if WPML treats the emptied editor as untranslated (unconfirmed), and OK_REALIGNED ones so
+  // their published headings can be checked.
+  function segmentsWithCode(code) {
     return state.run.results
-      .filter((r) => r.indexOf(':BLOCK_MISALIGNED') !== -1)
+      .filter((r) => r.indexOf(':' + code) !== -1)
       .map((r) => {
         const i = parseInt(r, 10);
         return i + ' (seg ' + (state.it[i] ? state.it[i].id : '?') + '): ' + r.slice(r.indexOf(':') + 1);
@@ -885,17 +886,34 @@
   // colon attached. Marker resolution and request-building happen in the SAME pass — every token IS the
   // live node it came from, no gid/text re-matching.
   function buildLiveSegmentTemplate(doc) {
+    const blocks = [];
+    doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph') return;
+      const nodes = [];
+      p.forEach((c) => nodes.push(c));
+      blocks.push({ from: off + 1, to: off + 1 + p.content.size, nodes });
+    });
+    return buildTemplateFromBlocks(blocks, []);
+  }
+
+  // blocks: [{from, to, nodes}] — the inline nodes that make up each translated piece, and the paragraph
+  // content range that piece is written back into. Normally one block per paragraph, in place
+  // (buildLiveSegmentTemplate); buildAlignedPlan() instead gathers each block's nodes from wherever
+  // copy_original put them. deletes: paragraph ranges to remove after writing. brNodes keeps each
+  // block's original hardBreak nodes in order, so the writer reinserts them with their attrs (WPML's
+  // hardBreakCtype extension stores the original separator type on them) instead of new bare ones.
+  function buildTemplateFromBlocks(blocks, deletes) {
     const pieces = [];
     const mk = [];
     const tokenNode = [];
-    let blockCount = 0;
-    function emit(c, parts) {
+    const brNodes = [];
+    function emit(c, parts, brs) {
       if (c.type.name === 'gMarker') {
         const n = mk.length;
         mk.push({ t: 'g', s: norm(c.textContent), gid: c.attrs.gid });
         tokenNode[n] = c;
         parts.push('{{' + n + '}}');
-        c.forEach((k) => emit(k, parts));
+        c.forEach((k) => emit(k, parts, brs));
         parts.push('{{/' + n + '}}');
       } else if (c.type.name === 'xMarker') {
         const n = mk.length;
@@ -904,23 +922,32 @@
         parts.push('{{' + n + '}}');
       } else if (c.type.name === 'hardBreak') {
         parts.push('[[BR]]');
+        brs.push(c);
       } else if (c.text) {
         parts.push(c.text);
       }
     }
-    doc.forEach((p) => {
-      if (p.type.name !== 'paragraph') return;
-      blockCount++;
+    blocks.forEach((b) => {
       const parts = [];
-      p.forEach((c) => emit(c, parts));
+      const brs = [];
+      b.nodes.forEach((c) => emit(c, parts, brs));
       pieces.push(norm(parts.join('')));
+      brNodes.push(brs);
     });
-    return { tp: pieces.join(' [[P]] '), mk, tokenNode, blockCount };
+    return {
+      tp: pieces.join(' [[P]] '),
+      mk,
+      tokenNode,
+      blockCount: blocks.length,
+      targets: blocks.map((b) => ({ from: b.from, to: b.to })),
+      brNodes,
+      deletes: deletes || [],
+    };
   }
 
   // Maps the retranslated response back onto the live doc. Piece count equals live block count by
-  // construction (both came from the same buildLiveSegmentTemplate() call), so this is a direct 1:1
-  // block-to-piece map — no mode detection, no blockG, none of writeSeg's reconciliation machinery.
+  // construction (both came from the same buildTemplateFromBlocks() call), so this is a direct 1:1
+  // block-to-target map — no mode detection, no blockG, none of writeSeg's reconciliation machinery.
   // Each piece is read left to right with a stack of open markers: text -> text node, [[BR]] ->
   // hardBreak, an x token -> its live node unchanged, {{n}} opens a gMarker, {{/n}} closes it by
   // rebuilding that marker around the translated children (node.type.create(attrs, children, marks)),
@@ -928,24 +955,24 @@
   // translated inline between its pair, never via a separate label. Pair order/nesting was already
   // validated against the source template (validateAiSegment); the stack checks here are a backstop.
   function writeSegFromLiveTemplate(editor, live, res) {
-    const doc = editor.state.doc, schema = editor.state.schema;
+    const schema = editor.state.schema;
     const mk = live.mk, tokenNode = live.tokenNode;
     const tgParas = res.tmpl.split('[[P]]');
     if (tgParas.length !== live.blockCount) {
       throw new Error('RETRANSLATE_PARA_MISMATCH_exp' + live.blockCount + '_got' + tgParas.length);
     }
     const edits = [];
-    let blockIdx = 0;
-    doc.forEach((p, off) => {
-      if (p.type.name !== 'paragraph') return;
+    live.targets.forEach((target, blockIdx) => {
       const tmplSlice = tgParas[blockIdx];
-      blockIdx++;
+      const brs = live.brNodes[blockIdx] || [];
+      let brUsed = 0;
       const stack = [{ n: null, children: [] }];
       const parts = tmplSlice.split(/(\{\{\/?\d+\}\}|\[\[BR\]\])/);
       parts.forEach((part) => {
         const top = stack[stack.length - 1];
         if (part === '[[BR]]') {
-          top.children.push(schema.nodes.hardBreak.create());
+          top.children.push(brUsed < brs.length ? brs[brUsed] : schema.nodes.hardBreak.create());
+          brUsed++;
           return;
         }
         const tm = part.match(/^\{\{(\/?)(\d+)\}\}$/);
@@ -968,6 +995,11 @@
         if (text) top.children.push(schema.text(text));
       });
       if (stack.length !== 1) throw new Error('RETRANSLATE: {{' + stack[stack.length - 1].n + '}} never closed');
+      // A [[BR]] moved into a different piece would land a line break (and its separator type) in the
+      // wrong paragraph — the total-count check in validateAiSegment can't see that, this can.
+      if (brUsed !== brs.length) {
+        throw new Error('RETRANSLATE: piece ' + blockIdx + ' has ' + brUsed + ' [[BR]], source had ' + brs.length);
+      }
       const content = stack[0].children;
       // The AI may put spaces around [[BR]] that aren't in the source — trimmed the same way paragraph
       // edges are below, so a hard break never ends up with a stray space glued to it. Nulled first,
@@ -1002,15 +1034,104 @@
         if (trimmedEnd) content[li] = schema.text(trimmedEnd);
         else content.pop();
       }
-      edits.push({ from: off + 1, to: off + 1 + p.content.size, content });
+      edits.push({ from: target.from, to: target.to, content });
     });
+    live.deletes.forEach((d) => edits.push({ from: d.from, to: d.to, del: true }));
     edits.sort((a, b) => b.from - a.from);
     let tr = editor.state.tr;
-    edits.forEach((e) => { tr = tr.replaceWith(e.from, e.to, e.content); });
+    edits.forEach((e) => { tr = e.del ? tr.delete(e.from, e.to) : tr.replaceWith(e.from, e.to, e.content); });
     editor.view.dispatch(tr);
     let cnt = 0;
     editor.state.doc.descendants((n) => { if (n.type.name === 'gMarker' || n.type.name === 'xMarker') cnt++; });
     return { edits: edits.length, markersBefore: tokenNode.length, markersAfter: cnt };
+  }
+
+  // ---------- block realignment (2026-11-10) ----------
+  // When findBlockMisalignment() finds copy_original's content shifted against WPML's block tags, this
+  // builds the write plan that puts each source block's content into the paragraph WPML tagged with that
+  // block's gid. The tags are already right per gid (confirmed live on 9807444226: data-paragraph-gid
+  // gid_7 carries h2, gid_14 carries h3); only the content is in the wrong paragraphs, and WPML saves by
+  // position, so content placed by gid comes out right on save.
+  //  - Each tagged paragraph is matched, in document order, to the first later content paragraph whose
+  //    text equals its <g> block's text in original_content (the editor still holds the English source).
+  //  - Untagged content — paragraphs that match no block, e.g. the leading "An adjuster… / Our
+  //    experienced…" text — is folded into the next tagged paragraph, in front of its own block, joined
+  //    by a line break. WPML tags top-down, so every untagged paragraph sits after the last tagged one:
+  //    putting leading text there would move it to the bottom of the page.
+  //  - Untagged content after the last block goes into the untagged paragraphs at the end, in order.
+  //    Untagged paragraphs left empty are deleted.
+  // Returns {blocks, deletes} for buildTemplateFromBlocks(), or {error} when the doc can't be aligned
+  // this way — the caller then falls back to BLOCK_MISALIGNED. The line break inserted at a fold is a new
+  // plain hardBreak; every other one is the original node, attrs included. Not yet confirmed on a
+  // published page.
+  function buildAlignedPlan(editor, oc) {
+    const doc = editor.state.doc, schema = editor.state.schema;
+    const paras = [];
+    let nonParagraph = false;
+    doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph') { nonParagraph = true; return; }
+      const dom = editor.view.nodeDOM(off);
+      const gid = dom && dom.getAttribute ? dom.getAttribute('data-paragraph-gid') : null;
+      const nodes = [];
+      p.forEach((c) => nodes.push(c));
+      paras.push({ off, p, gid, text: norm(p.textContent), nodes });
+    });
+    if (nonParagraph) return { error: 'non-paragraph block in the doc' };
+    const firstUntagged = paras.findIndex((x) => !x.gid);
+    if (firstUntagged !== -1 && paras.slice(firstUntagged).some((x) => x.gid)) {
+      return { error: 'a tagged paragraph follows an untagged one' };
+    }
+    const slots = paras.filter((x) => x.gid);
+    if (!slots.length) return { error: 'no tagged paragraphs' };
+    const match = [];
+    let from = 0;
+    for (const s of slots) {
+      const expected = gInnerText(oc, s.gid);
+      if (expected == null) return { error: s.gid + ' not found in original_content' };
+      let j = -1;
+      for (let k = from; k < paras.length; k++) {
+        if (paras[k].text === expected) { j = k; break; }
+      }
+      if (j === -1) return { error: 'no content paragraph matches ' + s.gid };
+      match.push(j);
+      from = j + 1;
+    }
+    const sep = () => schema.nodes.hardBreak.create();
+    const fold = (idxs) => {
+      const out = [];
+      idxs.forEach((k, n) => {
+        if (n) out.push(sep());
+        out.push(...paras[k].nodes);
+      });
+      return out;
+    };
+    const range = (a, b) => { const r = []; for (let k = a; k < b; k++) r.push(k); return r; };
+    const blocks = [];
+    const deletes = [];
+    let prev = 0;
+    slots.forEach((s, i) => {
+      const lead = range(prev, match[i]);
+      const own = paras[match[i]].nodes;
+      const nodes = lead.length ? fold(lead).concat([sep()], own) : own.slice();
+      blocks.push({ from: s.off + 1, to: s.off + 1 + s.p.content.size, nodes });
+      prev = match[i] + 1;
+    });
+    const trailing = range(prev, paras.length);
+    const untagged = paras.filter((x) => !x.gid);
+    if (trailing.length && !untagged.length) {
+      const last = blocks[blocks.length - 1];
+      last.nodes = last.nodes.concat([sep()], fold(trailing));
+    } else {
+      untagged.forEach((x, i) => {
+        if (i < trailing.length) {
+          const idxs = i === untagged.length - 1 ? trailing.slice(i) : [trailing[i]];
+          blocks.push({ from: x.off + 1, to: x.off + 1 + x.p.content.size, nodes: fold(idxs) });
+        } else {
+          deletes.push({ from: x.off, to: x.off + x.p.nodeSize });
+        }
+      });
+    }
+    return { blocks, deletes };
   }
 
   // One-shot orchestration: build the live template, re-translate just this segment (reusing
@@ -1021,10 +1142,11 @@
   // pollute wpml.ai.status()'s count or a later wpml.ai.retryFailed() call with a sentinel no real
   // segment will ever match.
   const RETRY_I = -1;
-  async function retranslateAndWrite(editor) {
+  // plan: optional {blocks, deletes} from buildAlignedPlan(); without it every paragraph is its own block.
+  async function retranslateAndWrite(editor, plan) {
     let live;
     try {
-      live = buildLiveSegmentTemplate(editor.state.doc);
+      live = plan ? buildTemplateFromBlocks(plan.blocks, plan.deletes) : buildLiveSegmentTemplate(editor.state.doc);
     } catch (e) {
       return { ok: false, code: 'RETRANSLATE_BUILD_ERROR: ' + e.message };
     }
@@ -1091,10 +1213,18 @@
     if (ed.kind === 'tiptap') {
       // Every failure return below clears a copy_original'd source first (see clearCopiedSource).
       const fail = (code) => { clearCopiedSource(ed); return code; };
+      // copy_original shifted the content against WPML's block tags: translate from the live doc with each
+      // block's content placed in its own gid's paragraph (buildAlignedPlan). BLOCK_MISALIGNED is only
+      // the fallback when that plan can't be built. Any batch translation for this segment is unused.
       const misaligned = findBlockMisalignment(ed.raw, meta.oc);
-      if (misaligned) return fail('BLOCK_MISALIGNED: ' + misaligned);
       let result;
-      if (tmplEs == null) {
+      if (misaligned) {
+        const plan = buildAlignedPlan(ed.raw, meta.oc);
+        if (plan.error) return fail('BLOCK_MISALIGNED: ' + misaligned + ' — ' + plan.error);
+        const retry = await retranslateAndWrite(ed.raw, plan);
+        if (!retry.ok) return fail(retry.code);
+        result = retry.result;
+      } else if (tmplEs == null) {
         // liveExtract segment (queued by queueLiveSegments() with no batch template): its extracted
         // template couldn't be trusted, so translate it straight from the live doc.
         const retry = await retranslateAndWrite(ed.raw);
@@ -1125,7 +1255,9 @@
         try { writeSeg(ed.raw, meta, { tmpl: tmplEs, linkTexts }); } catch (e) { /* still report the revert below either way */ }
         return 'CONTENT_REVERTED';
       }
-      return 'OK';
+      // OK_REALIGNED still counts as OK in prog() (contains ":OK"), and is listed in vprog().realigned so the
+      // published headings of these segments can be checked.
+      return misaligned ? 'OK_REALIGNED' : 'OK';
     }
 
     // The live-doc path needs a ProseMirror doc; TinyMCE has none, and a liveExtract segment's extracted
@@ -1957,7 +2089,10 @@
     vprog() {
       const v = state.vJob;
       if (!v) return 'no verify yet';
-      return { done: v.done, total: v.total, missing: v.missing, english: v.english, markerLost: v.markerLost, manual: manualSegments() };
+      return {
+        done: v.done, total: v.total, missing: v.missing, english: v.english, markerLost: v.markerLost,
+        manual: segmentsWithCode('BLOCK_MISALIGNED'), realigned: segmentsWithCode('OK_REALIGNED'),
+      };
     },
     // low-level access for debugging
     _state: state,
@@ -2568,7 +2703,8 @@
       const live = liveSummary();
       translatePageResultEl.textContent = headerText + (live ? '\n' + live : '') +
         '\n\nVerify: missing=' + v.missing.length + ' english=' + v.english.length + ' markerLost=' + v.markerLost.length +
-        (v.manual.length ? '\nNeeds manual translation (WPML block misalignment):\n  ' + v.manual.join('\n  ') : '') +
+        (v.realigned.length ? '\nRealigned headings (check the published page):\n  ' + v.realigned.join('\n  ') : '') +
+        (v.manual.length ? '\nCould not realign — needs manual translation:\n  ' + v.manual.join('\n  ') : '') +
         (clean ? '\n(all clean)' : '\n(needs manual cleanup — see wpml.vprog() / Actions for details)');
     }
 
