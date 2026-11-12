@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.11
+// @version      4.12
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -363,6 +363,12 @@
   // written. Only judged while the doc still holds the English source (after copy_original, or a
   // stuck-English target), since that's the only time its text can be compared to original_content.
   const PAIRED_X_RE = /<x\b[^>]*[^/]>[\s\S]*?<\/x>/g;
+  // Paragraph-vs-<g> text comparisons ignore whitespace entirely, the same as the whole-doc check.
+  // Confirmed live (segment 9818063234): the editor trims a trailing space inside a nested gMarker
+  // ("In Georgia," | "the law…") while original_content keeps it ("In Georgia, </g><g>the law…"), so
+  // collapsing whitespace with norm() still left "In Georgia,the" ≠ "In Georgia, the" — a false
+  // BLOCK_MISALIGNED on a correctly aligned segment.
+  const stripWs = (s) => String(s || '').replace(/\s+/g, '');
   function gInnerText(oc, gid) {
     const open = new RegExp('<g\\s+id="' + gid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"[^>]*>');
     const m = open.exec(oc);
@@ -383,10 +389,9 @@
   }
   function findBlockMisalignment(editor, oc) {
     if (!oc) return null;
-    const strip = (s) => s.replace(/\s+/g, '');
     let docText = '';
     editor.state.doc.forEach((p) => { docText += p.textContent; });
-    if (strip(docText) !== strip(decodeEntities(oc.replace(PAIRED_X_RE, '')))) return null; // not the English source
+    if (stripWs(docText) !== stripWs(decodeEntities(oc.replace(PAIRED_X_RE, '')))) return null; // not the English source
     const bad = [];
     let idx = 0;
     editor.state.doc.forEach((p, off) => {
@@ -396,7 +401,7 @@
       const gid = dom && dom.getAttribute ? dom.getAttribute('data-paragraph-gid') : null;
       if (!gid) return;
       const expected = gInnerText(oc, gid);
-      if (expected != null && norm(p.textContent) !== expected) bad.push('p' + i + '=' + gid);
+      if (expected != null && stripWs(p.textContent) !== stripWs(expected)) bad.push('p' + i + '=' + gid);
     });
     return bad.length ? bad.join(',') : null;
   }
@@ -1090,7 +1095,7 @@
       if (expected == null) return { error: s.gid + ' not found in original_content' };
       let j = -1;
       for (let k = from; k < paras.length; k++) {
-        if (paras[k].text === expected) { j = k; break; }
+        if (stripWs(paras[k].text) === stripWs(expected)) { j = k; break; }
       }
       if (j === -1) return { error: 'no content paragraph matches ' + s.gid };
       match.push(j);
