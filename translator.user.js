@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.12
+// @version      4.13
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -1610,7 +1610,14 @@
     lines.push('');
     if (corrections && Object.keys(corrections).length) {
       lines.push('These segments failed validation last attempt — fix ONLY the stated problem, keep everything else the same:');
-      for (const i in corrections) lines.push('- i=' + i + ': ' + corrections[i]);
+      for (const i in corrections) {
+        const c = corrections[i];
+        let why = '';
+        if (c === 'UNCHANGED_FROM_SOURCE') why = ' (your "tmpl" was the ' + cfg.sourceLang + ' source, untranslated — translate all of its text into ' + cfg.targetLang + ')';
+        else if (c.indexOf('UNCHANGED_FROM_SOURCE_PAIR_') === 0) why = ' (the text inside that pair was left in ' + cfg.sourceLang + ' — translate it into ' + cfg.targetLang + ')';
+        else if (c.indexOf('UNCHANGED_FROM_SOURCE_PARA_') === 0) why = ' (the text of [[P]] section ' + c.slice(27) + ' (counting from 0), outside any pair, was left in ' + cfg.sourceLang + ' — translate it into ' + cfg.targetLang + ')';
+        lines.push('- i=' + i + ': ' + c + why);
+      }
       lines.push('');
     }
     lines.push('Input segments:');
@@ -1907,6 +1914,60 @@
     return { pairs, parent, filled };
   }
 
+  // ---------- unchanged-from-source check (2026-11-18) ----------
+  // Confirmed live (segment 9852942557): the AI intermittently returns the source unchanged. Every
+  // structural check passes, so the English was written and reported OK; re-running the same segment
+  // translated it correctly, so a corrective retry resolves it. Text is compared with {{n}}/{{/n}}/
+  // [[P]]/[[BR]] tokens, punctuation, whitespace and case removed. Only text of at least ECHO_MIN_WORDS
+  // words is judged, so short text that is legitimately the same in both languages (names, "Knox
+  // County") is never rejected. This only detects a copy of the source; it never judges a translation.
+  const ECHO_MIN_WORDS = 4;
+  const ECHO_TOKEN_RE = /\{\{\/?\d+\}\}|\[\[P\]\]|\[\[BR\]\]/g;
+  function echoKey(s) {
+    return String(s || '').replace(ECHO_TOKEN_RE, ' ').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  }
+  function isEcho(src, out) {
+    const words = (String(src || '').replace(ECHO_TOKEN_RE, ' ').match(/\p{L}+/gu) || []).length;
+    return words >= ECHO_MIN_WORDS && echoKey(src) === echoKey(out);
+  }
+  // Text inside each {{n}}…{{/n}} pair, keyed by n, nested pairs' text included. Only called on strings
+  // pairTree() has already accepted, with pairs = the source's pair indices.
+  function pairTexts(str, pairs) {
+    const texts = {};
+    const stack = [];
+    const re = /\{\{(\/?)(\d+)\}\}/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(str))) {
+      const chunk = str.slice(last, m.index);
+      stack.forEach((n) => { texts[n] += chunk; });
+      last = re.lastIndex;
+      const n = parseInt(m[2], 10);
+      if (!pairs.has(n)) continue;
+      if (m[1]) stack.pop();
+      else { stack.push(n); texts[n] = ''; }
+    }
+    return texts;
+  }
+  // Text outside every pair, one entry per [[P]] piece (e.g. a plain paragraph after a bulleted list).
+  // [[P]] never sits inside a pair (pairTree() rejects that), so splitting on it first is safe.
+  function outerTexts(str, pairs) {
+    return str.split('[[P]]').map((piece) => {
+      let depth = 0;
+      let last = 0;
+      let out = '';
+      const re = /\{\{(\/?)(\d+)\}\}/g;
+      let m;
+      while ((m = re.exec(piece))) {
+        if (!depth) out += piece.slice(last, m.index);
+        last = re.lastIndex;
+        if (!pairs.has(parseInt(m[2], 10))) continue;
+        depth += m[1] ? -1 : 1;
+      }
+      return out + (depth ? '' : piece.slice(last));
+    });
+  }
+
   function validateAiSegment(out, byIdx) {
     if (!out || typeof out.i !== 'number' || !byIdx[out.i]) return 'UNKNOWN_INDEX';
     if (typeof out.tmpl !== 'string') return 'TMPL_NOT_STRING';
@@ -1936,9 +1997,11 @@
     // Paired {{n}}…{{/n}} markers only ever come from buildLiveSegmentTemplate() — no-op otherwise.
     // Every token must keep the same enclosing pair it had in the source, and a pair that had content
     // can't come back empty, so the writer can rebuild the exact same marker nesting.
+    let srcPairs = null;
     if (byIdx[out.i].tp.indexOf('{{/') !== -1) {
       const src = pairTree(byIdx[out.i].tp, null);
       if (typeof src === 'string') return 'SRC_' + src;
+      srcPairs = src.pairs;
       const tgt = pairTree(out.tmpl, src.pairs);
       if (typeof tgt === 'string') return tgt;
       for (const n in src.parent) {
@@ -1950,6 +2013,22 @@
     }
     const lt = out.linkTexts || [];
     if (lt.length !== expected) return 'LINKTEXTS_LENGTH_MISMATCH_exp' + expected + '_got' + lt.length;
+    // Judged last, so a structural error is always reported first. The per-paragraph and per-pair checks
+    // catch a partial echo the whole-segment one can't: a paragraph left in English (e.g. the plain text
+    // after a list), or some list bullets translated and others not. Paragraph counts already match here.
+    if (isEcho(byIdx[out.i].tp, out.tmpl)) return 'UNCHANGED_FROM_SOURCE';
+    const srcOuter = outerTexts(byIdx[out.i].tp, srcPairs || new Set());
+    const outOuter = outerTexts(out.tmpl, srcPairs || new Set());
+    for (let k = 0; k < srcOuter.length; k++) {
+      if (isEcho(srcOuter[k], outOuter[k])) return 'UNCHANGED_FROM_SOURCE_PARA_' + k;
+    }
+    if (srcPairs) {
+      const srcText = pairTexts(byIdx[out.i].tp, srcPairs);
+      const outText = pairTexts(out.tmpl, srcPairs);
+      for (const n of srcPairs) {
+        if (isEcho(srcText[n], outText[n])) return 'UNCHANGED_FROM_SOURCE_PAIR_' + n;
+      }
+    }
     return null;
   }
 
