@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WPML Batch Translator Helper
 // @namespace    everconvert
-// @version      4.13
+// @version      4.14
 // @author       Carlos
 // @description  Batch-translate WPML Advanced Translation Editor segments via console / paste-in, or via Gemini/Claude/OpenAI. Preserves inline links & hidden markers.
 // @match        https://*.ate.wpml.org/*
@@ -369,7 +369,35 @@
   // collapsing whitespace with norm() still left "In Georgia,the" ≠ "In Georgia, the" — a false
   // BLOCK_MISALIGNED on a correctly aligned segment.
   const stripWs = (s) => String(s || '').replace(/\s+/g, '');
-  function gInnerText(oc, gid) {
+  // Confirmed live (segment 9853115702, nested list): a list-item wrapper <g gid_0> holds its label and a
+  // nested sub-list whose item <g gid_5> renders as its OWN paragraph (data-paragraph-gid=gid_5). Comparing
+  // gid_0's paragraph against gid_0's full subtree (label + sub-item) matched no paragraph — a false
+  // BLOCK_MISALIGNED. blockGids = every gid that tags a paragraph in this doc; a nested <g> in that set is
+  // dropped with its whole subtree, so each paragraph is compared against only the text it shows itself.
+  // A <g> with no nested paragraph gid comes out exactly as before.
+  function dropBlockGs(s, blockGids) {
+    if (!blockGids || !blockGids.size) return s;
+    const re = /<(\/?)g\b([^>]*?)(\/?)>/g;
+    let out = '';
+    let last = 0;
+    let skip = 0;
+    let m;
+    while ((m = re.exec(s))) {
+      if (!skip) out += s.slice(last, m.index);
+      last = re.lastIndex;
+      if (skip) {
+        if (m[1]) skip--;
+        else if (!m[3]) skip++;
+        continue;
+      }
+      const id = (m[2].match(/\bid="([^"]+)"/) || [])[1];
+      if (!m[1] && !m[3] && id && blockGids.has(id)) { skip = 1; continue; }
+      out += m[0];
+    }
+    if (!skip) out += s.slice(last);
+    return out;
+  }
+  function gInnerText(oc, gid, blockGids) {
     const open = new RegExp('<g\\s+id="' + gid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"[^>]*>');
     const m = open.exec(oc);
     if (!m) return null;
@@ -385,7 +413,17 @@
       }
     }
     if (!t) return null;
-    return norm(decodeEntities(oc.slice(m.index + m[0].length, t.index).replace(PAIRED_X_RE, '')));
+    return norm(decodeEntities(dropBlockGs(oc.slice(m.index + m[0].length, t.index), blockGids).replace(PAIRED_X_RE, '')));
+  }
+  function paragraphGids(editor) {
+    const gids = new Set();
+    editor.state.doc.forEach((p, off) => {
+      if (p.type.name !== 'paragraph') return;
+      const dom = editor.view.nodeDOM(off);
+      const gid = dom && dom.getAttribute ? dom.getAttribute('data-paragraph-gid') : null;
+      if (gid) gids.add(gid);
+    });
+    return gids;
   }
   function findBlockMisalignment(editor, oc) {
     if (!oc) return null;
@@ -393,6 +431,7 @@
     editor.state.doc.forEach((p) => { docText += p.textContent; });
     if (stripWs(docText) !== stripWs(decodeEntities(oc.replace(PAIRED_X_RE, '')))) return null; // not the English source
     const bad = [];
+    const blockGids = paragraphGids(editor);
     let idx = 0;
     editor.state.doc.forEach((p, off) => {
       const i = idx++;
@@ -400,7 +439,7 @@
       const dom = editor.view.nodeDOM(off);
       const gid = dom && dom.getAttribute ? dom.getAttribute('data-paragraph-gid') : null;
       if (!gid) return;
-      const expected = gInnerText(oc, gid);
+      const expected = gInnerText(oc, gid, blockGids);
       if (expected != null && stripWs(p.textContent) !== stripWs(expected)) bad.push('p' + i + '=' + gid);
     });
     return bad.length ? bad.join(',') : null;
@@ -1088,10 +1127,11 @@
     }
     const slots = paras.filter((x) => x.gid);
     if (!slots.length) return { error: 'no tagged paragraphs' };
+    const blockGids = new Set(slots.map((s) => s.gid)); // same set paragraphGids() gives findBlockMisalignment()
     const match = [];
     let from = 0;
     for (const s of slots) {
-      const expected = gInnerText(oc, s.gid);
+      const expected = gInnerText(oc, s.gid, blockGids);
       if (expected == null) return { error: s.gid + ' not found in original_content' };
       let j = -1;
       for (let k = from; k < paras.length; k++) {
